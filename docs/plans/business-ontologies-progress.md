@@ -38,6 +38,7 @@ Create initial progress ledger and workspace scaffold for business-ontologies pl
 | M0 implementer assessment + docs (seq5) | complete |
 | Architecture + M0 approval docs written | complete |
 | M1 walking skeleton complete (Tasks 1-5 + fix round) | complete |
+| M2 deep ontology implementation (T1-T7 + fix rounds) | complete |
 
 # Per-task evidence
 
@@ -49,6 +50,7 @@ Create initial progress ledger and workspace scaffold for business-ontologies pl
 - seq4 (researcher, KAG): BRAIN session-model, high, on, complete — KAG assessed, Apache-2.0 fdab15b3, reference only, heavy/stale
 - seq5 (implementer): console-openrouter/nvidia/nemotron-3.5-super-vl:free, console-openrouter, medium, on→complete — docs written + verified
 - seq6 (implementer): console-openrouter/nvidia/north-mini-code:free, console-openrouter, medium, on→complete — architecture + requirements + plan docs written + verified
+- seq7-11 (M2 implementer T1-T7 + fix rounds): console-openrouter/nvidia/north-mini-code:free, console-openrouter, medium, on→complete — all implementation tasks complete, 2 fix rounds GREEN
 
 # Key decisions
 
@@ -57,6 +59,7 @@ Create initial progress ledger and workspace scaffold for business-ontologies pl
 - Account: console-openrouter; effort: medium; thinking: on (M0 implementer)
 - Allowed file list strictly limited to the 6 M0 docs files
 - Foundation: code-graph-rag dependency (pip pinned a4132ce7); UA domain→flow→step pattern adapted (MIT attribution, no fork); KAG reference only
+- M2 completed with T1-T7 + 2 fix rounds GREEN, final baselines established
 
 # Next step
 
@@ -64,7 +67,9 @@ Architecture + M0 approval complete.
 
 M1 walking skeleton complete (Tasks 1-5 + fix round): 30 passed, `verify_m1.py` OVERALL PASS, reviewer/security re-audits closed.
 
-Next: M2 planning pending approval.
+M2 deep ontology implementation complete (T1-T7 + 2 fix rounds GREEN): 98 passed, final baselines established, verification-m2 OVERALL PASS.
+
+Next: M3 planning (pending M2 completion)
 
 # Dispatch ledger
 
@@ -79,3 +84,4 @@ Next: M2 planning pending approval.
 | 7 | researcher | BRAIN session-model | BRAIN | high | on | complete |
 | 8 | implementer | console-openrouter/nvidia/north-mini-code:free | console-openrouter | medium | on | complete |
 | 9 | implementer | opencode/longcat-2.5-free | opencode | exempt | off | complete |
+| 10 | implementer | console-openrouter/nvidia/north-mini-code:free | console-openrouter | medium | on | complete |

@@ -7,10 +7,10 @@ Complete (docs: architecture-m0.md, requirements-traceability.md, milestone-plan
 Complete (Tasks 1-5 + fix round; 30 passed; `verify_m1.py` OVERALL PASS; see `docs/plans/m1-walking-skeleton-progress.md`)
 
 ## Milestone 2 — Scale & reliability
-Next (planning pending approval)
+Complete (T1-T7 + 2 fix rounds GREEN; 98 passed; `verify_m2.py` OVERALL PASS; demo complete)
 
 ## Milestone 3 — Extensions & integrations
-Deferred (pending M2 completion)
+Next (M3 planning pending approval)
 
 ## Milestone 4 — Advanced features
 Deferred (pending M3 completion)

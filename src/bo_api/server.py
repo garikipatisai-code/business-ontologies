@@ -129,6 +129,24 @@ def _repo_param(parsed):
     return repo if repo else None
 
 
+def _status_param(parsed):
+    """Return the ?status= value from a parsed URL, else None (no scoping)."""
+    values = urllib.parse.parse_qs(parsed.query).get("status")
+    if not values:
+        return None
+    status = values[0]
+    return status if status else None
+
+
+def _subject_param(parsed):
+    """Return the ?subject= value from a parsed URL, else None (no scoping)."""
+    values = urllib.parse.parse_qs(parsed.query).get("subject")
+    if not values:
+        return None
+    subject = values[0]
+    return subject if subject else None
+
+
 def create_app(db_path):
     """Return a read-only request handler class bound to *db_path*."""
     # Ensure schema exists up front.
@@ -201,6 +219,28 @@ def create_app(db_path):
                 # Relations: cross-repo invocation edges persisted as provenance
                 # artifacts (kind "invokes"). M1 returns provenance artifacts;
                 # the invokes filter is deferred to M2, scoped here by ?repo=.
+                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                return
+            if path == "/status":
+                # Review status: all provenance artifacts carrying a review origin
+                # (deterministic / model-inferred / human-reviewed). M1 returns
+                # provenance artifacts; the status filter is deferred to M2.
+                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                return
+            if path == "/evidence":
+                # Evidence: all provenance artifacts (optionally scoped by ?repo=).
+                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                return
+            if path == "/conflicts":
+                # Evidence conflicts: all provenance artifacts with status "disputed".
+                # The status filter is deferred to M2, scoped here by ?repo=.
+                # For now, return all artifacts (filtering will be applied in M2).
+                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                return
+            if path == "/history":
+                # Review history: all provenance artifacts with review origin.
+                # The review filter is deferred to M2, scoped here by ?repo=.
+                # For now, return all artifacts (filtering will be applied in M2).
                 self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
                 return
             if path.startswith("/provenance/"):
