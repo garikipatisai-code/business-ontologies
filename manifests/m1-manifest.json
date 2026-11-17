@@ -1,0 +1,23 @@
+{
+  "workspace_root": ".",
+  "repos": [
+    {
+      "name": "repo-a",
+      "path": "fixtures/repo-a",
+      "description": "Order service",
+      "context": "order-service",
+      "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "branch": "main",
+      "exclusions": ["*.pyc", "__pycache__"]
+    },
+    {
+      "name": "repo-b",
+      "path": "fixtures/repo-b",
+      "description": "Refund policy",
+      "context": "refund-policy",
+      "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "branch": "main",
+      "exclusions": ["*.pyc", "__pycache__"]
+    }
+  ]
+}

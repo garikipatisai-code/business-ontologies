@@ -1,0 +1,1 @@
+code-graph-rag==0.7.1  # a4132ce7de7222f8de88d41a41f2ab80c87dfe8e
