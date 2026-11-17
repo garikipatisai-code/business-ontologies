@@ -227,10 +227,6 @@ def create_app(db_path):
                 # provenance artifacts; the status filter is deferred to M2.
                 self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
                 return
-            if path == "/evidence":
-                # Evidence: all provenance artifacts (optionally scoped by ?repo=).
-                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
-                return
             if path == "/conflicts":
                 # Evidence conflicts: all provenance artifacts with status "disputed".
                 # The status filter is deferred to M2, scoped here by ?repo=.
@@ -242,6 +238,38 @@ def create_app(db_path):
                 # The review filter is deferred to M2, scoped here by ?repo=.
                 # For now, return all artifacts (filtering will be applied in M2).
                 self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                return
+            # M3 read-only views (mount-only, no write verbs)
+            if path == "/m3/concepts":
+                # M3 concepts view: from heuristic extraction (C1)
+                try:
+                    from bo_extract.heuristic_concepts import discover
+                    concepts = discover(["fixtures/repo-d", "fixtures/repo-b"])
+                    self._send_json(concepts)
+                except Exception as e:
+                    self._send_json({"status": "error", "reason": str(e)}, status=500)
+                return
+            if path == "/m3/alignment":
+                # M3 alignment view: typed mappings (C2)
+                try:
+                    from bo_ontology.alignment import align
+                    from bo_extract.heuristic_concepts import discover
+                    concepts, links = discover(["fixtures/repo-d", "fixtures/repo-b"])
+                    mappings = align(concepts, links)
+                    self._send_json(mappings)
+                except Exception as e:
+                    self._send_json({"status": "error", "reason": str(e)}, status=500)
+                return
+            if path == "/m3/workflow":
+                # M3 workflow view: ordered steps with evidence (C2)
+                try:
+                    from bo_ontology.alignment import build_workflow
+                    from bo_extract.heuristic_concepts import discover
+                    concepts, _ = discover(["fixtures/repo-d", "fixtures/repo-b"])
+                    steps = build_workflow(concepts)
+                    self._send_json(steps)
+                except Exception as e:
+                    self._send_json({"status": "error", "reason": str(e)}, status=500)
                 return
             if path.startswith("/provenance/"):
                 raw = path[len("/provenance/"):]

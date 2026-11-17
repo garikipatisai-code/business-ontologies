@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+from collections import defaultdict
 from pathlib import Path
 
 from bo_store.manifest import verify_manifest
@@ -80,7 +81,7 @@ def _flow_label(class_name):
     return class_name
 
 
-def _constant_rule(stmt, class_name, file, step):
+def _constant_rule(stmt, class_name, file):
     """Build a Rule from a class-body constant assignment, else None."""
     if not isinstance(stmt, ast.Assign):
         return None
@@ -105,7 +106,6 @@ def _constant_rule(stmt, class_name, file, step):
                 "excerpt": f"{target.id} = {value!r}",
             },
             "flow": None,
-            "step": step,
             "confidence": 1.0,
             "basis": "stdlib ast class-attribute constant assignment",
         }
@@ -232,7 +232,7 @@ def extract_file(path):
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             for stmt in node.body:
-                rule = _constant_rule(stmt, node.name, file, None)
+                rule = _constant_rule(stmt, node.name, file)
                 if rule is None:
                     continue
                 rules.append(rule)
@@ -248,7 +248,7 @@ def extract_rule(path):
 
 # --------------------------------------------------------------------------
 # Deep deterministic ground truth (M2 T4): rules / transitions / event phases.
-# Structural ast patterns only; fixture code is parsed, never executed.
+# Structural ast patterns only; analyzed code is parsed, never executed.
 # --------------------------------------------------------------------------
 
 _STATE_LITERAL_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
@@ -272,6 +272,17 @@ def _module_constants(tree):
     return consts
 
 
+def _module_constant_entries(tree):
+    """Module-level ``NAME = <constant>`` assignments as (name, value, lineno)."""
+    entries = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    entries.append((t.id, node.value.value, node.lineno))
+    return entries
+
+
 def _functions_with_symbols(tree):
     """Yield (function_node, qualified_symbol) for module functions and methods."""
     for node in tree.body:
@@ -284,10 +295,11 @@ def _functions_with_symbols(tree):
 
 
 def _const_return(stmts):
-    """Return (bool_value, line) of the first ``return <bool constant>``, else (None, None)."""
+    """Return (outcome, line) of the first ``return <bool|None constant>``,
+    else (None, None). A ``None`` outcome is a resolved deny, not an absence."""
     for st in stmts:
         if (isinstance(st, ast.Return) and isinstance(st.value, ast.Constant)
-                and isinstance(st.value.value, bool)):
+                and (isinstance(st.value.value, bool) or st.value.value is None)):
             return st.value.value, st.lineno
     return None, None
 
@@ -332,85 +344,127 @@ def _fmt_operand(opd):
     return "unknown"
 
 
-def _decision_fields(fn, cls_name, file, module_consts, self_const=None):
-    """Structured decision fields for a method with a comparison predicate.
+def _predicate_fields(test, file, local_assigns, module_consts=None, self_const=None):
+    """Structured predicate (left op right) from a boolean guard test, else None.
 
-    Returns None when the method is not a boolean decision (no top-level
-    if-guard carrying a comparison with boolean constant outcomes).
+    Comparison guards yield ``left op right`` via the operand helper; negation
+    guards yield the negated operand. Unresolvable shapes abstain (None).
+    """
+    compare = next((n for n in ast.walk(test) if isinstance(n, ast.Compare)), None)
+    if compare is not None:
+        op = _COMPARE_OPS.get(type(compare.ops[0]), type(compare.ops[0]).__name__)
+        left = _operand(compare.left, local_assigns, module_consts, self_const)
+        right = _operand(compare.comparators[0], local_assigns, module_consts, self_const)
+        return {
+            "expression": ast.unparse(compare),
+            "left": left,
+            "op": op,
+            "right": right,
+            "evidence": {"file": file, "line": compare.lineno},
+        }
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        operand = _operand(test.operand, local_assigns, module_consts, self_const)
+        return {
+            "expression": ast.unparse(test),
+            "left": operand,
+            "op": "not",
+            "right": operand,
+            "evidence": {"file": file, "line": getattr(test, "lineno", 0)},
+        }
+    return None
+
+
+def _decision_fields(fn, cls_name, file, module_consts, self_const=None):
+    """Structured decision fields for a method guarded by a boolean predicate.
+
+    Returns None when no guard carries a resolvable boolean predicate with a
+    terminal outcome; abstains rather than emitting an empty predicate.
     """
     body = fn.body
     local_assigns = {}
-    for st in body:
+    for st in ast.walk(fn):
         if (isinstance(st, ast.Assign) and len(st.targets) == 1
                 and isinstance(st.targets[0], ast.Name)):
             local_assigns[st.targets[0].id] = st.value
-    main_if = None
-    for st in body:
-        if isinstance(st, ast.If) and any(isinstance(n, ast.Compare) for n in ast.walk(st.test)):
-            main_if = st
-            break
+    guards = sorted(
+        (n for n in ast.walk(fn) if isinstance(n, ast.If)),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    main_if = next(
+        (g for g in guards if any(isinstance(n, ast.Compare) for n in ast.walk(g.test))),
+        None,
+    )
+    if main_if is None:
+        main_if = next(
+            (g for g in guards if isinstance(g.test, (ast.BoolOp, ast.UnaryOp))),
+            None,
+        )
     if main_if is None:
         return None
-    compare = next(n for n in ast.walk(main_if.test) if isinstance(n, ast.Compare))
+    predicate = _predicate_fields(main_if.test, file, local_assigns, module_consts, self_const)
+    if predicate is None:
+        return None
     tv, tv_line = _const_return(main_if.body)
     fv, fv_line = _const_return(main_if.orelse)
-    if fv is None:
-        fv, fv_line = _const_return(body[body.index(main_if) + 1:])
-    if tv is None and fv is None:
+    main_index = next((i for i, st in enumerate(body) if st is main_if), len(body))
+    if fv_line is None:
+        fv, fv_line = _const_return(body[main_index + 1:])
+    if tv_line is None and fv_line is None:
         return None
-    op = _COMPARE_OPS.get(type(compare.ops[0]), type(compare.ops[0]).__name__)
-    left = _operand(compare.left, local_assigns, module_consts, self_const)
-    right = _operand(compare.comparators[0], local_assigns, module_consts, self_const)
+    op = predicate["op"]
+    left = predicate["left"]
+    right = predicate["right"]
 
     eligibility_shaped = "eligib" in fn.name.lower()
     outcomes = []
-    if tv is not None:
+    if tv_line is not None:
         entry = {"when": "predicate true", "value": tv, "evidence": {"file": file, "line": tv_line}}
         if eligibility_shaped:
             entry["label"] = "eligible" if tv else "ineligible"
         outcomes.append(entry)
-    if fv is not None:
+    if fv_line is not None:
         entry = {"when": "predicate false", "value": fv, "evidence": {"file": file, "line": fv_line}}
         if eligibility_shaped:
             entry["label"] = "eligible" if fv else "ineligible"
         outcomes.append(entry)
 
     exceptions = []
-    for st in body:
-        if isinstance(st, ast.If) and st is not main_if:
-            ev, ev_line = _const_return(st.body)
-            if ev is None:
-                continue
-            requires = {n.id for n in ast.walk(st.test) if isinstance(n, ast.Name)}
-            requires |= {
-                f"{_dotted(c.func.value)}.{c.args[0].value}"
-                for c in ast.walk(st.test)
-                if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-                and _dotted(c.func.value) and c.args
-                and isinstance(c.args[0], ast.Constant)
-                and isinstance(c.args[0].value, str)
-            }
-            exceptions.append({
-                "condition": ast.unparse(st.test),
-                "outcome": ev,
-                "requires": sorted(requires),
-                "evidence": {"file": file, "line": st.lineno},
-            })
+    for st in guards:
+        if st is main_if:
+            continue
+        ev, ev_line = _const_return(st.body)
+        if ev_line is None:
+            continue
+        requires = {n.id for n in ast.walk(st.test) if isinstance(n, ast.Name)}
+        requires |= {
+            f"{_dotted(c.func.value)}.{c.args[0].value}"
+            for c in ast.walk(st.test)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+            and _dotted(c.func.value) and c.args
+            and isinstance(c.args[0], ast.Constant)
+            and isinstance(c.args[0].value, str)
+        }
+        exceptions.append({
+            "condition": ast.unparse(st.test),
+            "outcome": ev,
+            "requires": sorted(requires),
+            "evidence": {"file": file, "line": st.lineno},
+        })
 
     params = [a.arg for a in fn.args.args if a.arg != "self"]
     params += [a.arg for a in fn.args.kwonlyargs]
 
-    predicate = {
-        "expression": ast.unparse(compare),
-        "left": left,
-        "op": op,
-        "right": right,
-        "evidence": {"file": file, "line": compare.lineno},
-    }
-    statement = (
-        f"{cls_name}.{fn.name}: if {_fmt_operand(left)} {op} {_fmt_operand(right)} "
-        f"then return {tv!r}; otherwise return {fv!r}."
-    )
+    if tv_line is not None and fv_line is not None:
+        statement = (
+            f"{cls_name}.{fn.name}: if {_fmt_operand(left)} {op} {_fmt_operand(right)} "
+            f"then return {tv!r}; otherwise return {fv!r}."
+        )
+    else:
+        statement = (
+            f"{cls_name}.{fn.name}:"
+            + "".join(f" when {o['when']}, return {o['value']!r}" for o in outcomes)
+            + "."
+        )
     return {
         "statement": statement,
         "preconditions": [],  # no guard dominates the predicate comparison here
@@ -434,10 +488,154 @@ def _decision_fields(fn, cls_name, file, module_consts, self_const=None):
     }
 
 
+def _has_dispatch_indirection(fn):
+    """True only for genuine dispatch/loop control flow: a loop, a dispatch-table
+    lookup (subscript with a dynamic key), or a dynamic getattr load."""
+    for n in ast.walk(fn):
+        if isinstance(n, (ast.For, ast.While)):
+            return True
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "getattr" and len(n.args) >= 2 and isinstance(n.args[1], (ast.Name, ast.Attribute, ast.Call, ast.BinOp, ast.Subscript)):
+            return True
+        if isinstance(n, ast.Subscript) and isinstance(n.slice, (ast.Name, ast.Attribute, ast.Call, ast.BinOp)):
+            return True
+    return False
+
+
+def _dispatch_loop_decision_fields(fn, cls_name, file, module_consts=None):
+    """Structured decision fields for methods with genuine dispatch indirection.
+
+    Requires dispatch-table/loop control flow (loop, dispatch-table lookup, or
+    dynamic getattr load) plus at least one guard. Returns None otherwise.
+    """
+
+    # Collect guard conditions via one structural walk, ordered by position.
+    guards = sorted(
+        (n for n in ast.walk(fn) if isinstance(n, ast.If)),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    if not guards:
+        return None
+    
+    # Check if method returns dict or None (computed values)
+    has_computed_returns = False
+    for st in ast.walk(fn):
+        if not isinstance(st, ast.Return):
+            continue
+        if isinstance(st.value, ast.Dict):
+            has_computed_returns = True
+        elif isinstance(st.value, ast.Constant):
+            if st.value.value is None:
+                has_computed_returns = True
+        elif isinstance(st.value, ast.Call) and isinstance(st.value.func, ast.Name):
+            if st.value.func.id == "getattr" and len(st.value.args) >= 2:
+                has_computed_returns = True
+
+    if not has_computed_returns:
+        return None
+    
+    # Real dispatch indirection is required: a loop, a dispatch-table lookup,
+    # or a dynamic getattr load. Guards alone are boolean decisions, not dispatch.
+    if not _has_dispatch_indirection(fn):
+        return None
+    
+    # Extract guard conditions and outcomes
+    outcomes = []
+    first_guard = guards[0]
+    predicate = _predicate_fields(first_guard.test, file, {}, module_consts)
+    if predicate is None:
+        return None
+
+    for st in guards:
+        # Extract return values from this guard
+        ret_val = None
+        ret_line = None
+        if st.body and isinstance(st.body[0], ast.Return):
+            ret_val = st.body[0].value
+            ret_line = st.body[0].lineno
+        elif st.orelse and isinstance(st.orelse[0], ast.Return):
+            ret_val = st.orelse[0].value
+            ret_line = st.orelse[0].lineno
+
+        if ret_val is not None:
+            # Describe the return value
+            if isinstance(ret_val, ast.Dict):
+                outcomes.append({
+                    "when": ast.unparse(st.test),
+                    "value": "dict",
+                    "evidence": {"file": file, "line": ret_line},
+                    "description": "computed value (dict)",
+                })
+            elif isinstance(ret_val, ast.Constant):
+                if ret_val.value is None:
+                    outcomes.append({
+                        "when": ast.unparse(st.test),
+                        "value": None,
+                        "evidence": {"file": file, "line": ret_line},
+                        "description": "computed value (None)",
+                    })
+                else:
+                    outcomes.append({
+                        "when": ast.unparse(st.test),
+                        "value": ret_val.value,
+                        "evidence": {"file": file, "line": ret_line},
+                        "description": f"computed value ({type(ret_val.value).__name__})",
+                    })
+            else:
+                outcomes.append({
+                    "when": ast.unparse(st.test),
+                    "value": "complex",
+                    "evidence": {"file": file, "line": ret_line},
+                    "description": "computed value (complex expression)",
+                })
+    
+    if not outcomes:
+        return None
+    
+    # Build statement describing the method
+    statement_parts = []
+    for outcome in outcomes:
+        if outcome["value"] is None:
+            statement_parts.append(f"{cls_name}.{fn.name}: when {outcome['when']}, return None")
+        elif outcome["value"] == "dict":
+            statement_parts.append(f"{cls_name}.{fn.name}: when {outcome['when']}, return dict")
+        elif outcome["value"] == "complex":
+            statement_parts.append(f"{cls_name}.{fn.name}: when {outcome['when']}, return complex")
+        else:
+            statement_parts.append(f"{cls_name}.{fn.name}: when {outcome['when']}, return {outcome['value']!r}")
+    
+    statement = "; ".join(statement_parts) + "."
+    
+    # Extract method parameters
+    params = [a.arg for a in fn.args.args if a.arg != "self"]
+    params += [a.arg for a in fn.args.kwonlyargs]
+    
+    return {
+        "statement": statement,
+        "preconditions": [],
+        "predicate": predicate,
+        "params": params,
+        "exceptions": [],
+        "outcomes": outcomes,
+        "enforcement_location": {
+            "file": file,
+            "line": first_guard.lineno,
+            "symbol": f"{cls_name}.{fn.name}",
+        },
+        "supporting": [
+            {"file": file, "line": first_guard.lineno, "excerpt": ast.unparse(first_guard.test)},
+        ],
+        "conflicting": [],
+        "limitations": [
+            "structural ast analysis; the analyzed code is parsed, never executed",
+            "computed values resolved from guard conditions and return expressions",
+        ],
+    }
+
+
 def _deepen_constant_rules(trees, rules):
     """Attach deep ground-truth fields to class-constant rules via the
     methods in the same class that reference the constant (symbol resolution,
-    never hardcoded fixture names)."""
+    source names only)."""
     for rule in rules:
         if "predicate" in rule:
             continue
@@ -467,6 +665,9 @@ def _deepen_constant_rules(trees, rules):
                     self_const=(const_name, rule.get("value")),
                 )
                 if fields is None:
+                    # Try dispatch/loop pattern
+                    fields = _dispatch_loop_decision_fields(m, cls_name, str(rule["file"]), module_consts)
+                if fields is None:
                     continue
                 rule.update(fields)
                 rule["statement"] = (
@@ -494,6 +695,9 @@ def _decision_rules(trees):
                     continue
                 fields = _decision_fields(m, cdef.name, file, module_consts)
                 if fields is None:
+                    # Try dispatch/loop pattern
+                    fields = _dispatch_loop_decision_fields(m, cdef.name, file, module_consts)
+                if fields is None:
                     continue
                 out.append({
                     "name": f"{cdef.name}.{m.name}",
@@ -511,11 +715,87 @@ def _decision_rules(trees):
     return out
 
 
+def _module_constant_links(trees, edges, rules):
+    """Detect links between same-type equal-value module constants with a
+    shared name token of 4+ characters, recording evidence plus a limitation
+    that name overlap is not proof of shared business meaning."""
+    # Group constants by value
+    value_groups = defaultdict(list)
+    
+    # Add module constants
+    for file, tree in trees.items():
+        for name, value, lineno in _module_constant_entries(tree):
+            if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+                value_groups[value].append((file, name, value, "module_constant", lineno))
+    
+    # Add class constants from rules
+    for rule in rules:
+        if "symbol" in rule and "." in rule["symbol"]:
+            cls_name, const_name = rule["symbol"].split(".", 1)
+            if "value" in rule and isinstance(rule["value"], (int, float, str)) and not isinstance(rule["value"], bool):
+                # Extract file from rule (using first rule's file if not available)
+                rule_file = rule.get("file", list(trees.keys())[0] if trees else "")
+                value_groups[rule["value"]].append(
+                    (rule_file, const_name, rule["value"], "class_constant", rule.get("line") or 0)
+                )
+    
+    # Process each value group
+    for value, consts in value_groups.items():
+        if len(consts) < 2:  # Need at least 2 constants to link
+            continue
+        
+        # Check each pair for shared name token (4+ chars, alphabetic only)
+        for i, entry in enumerate(consts):
+            file1, name1, val1, type1, line1 = entry
+            for j, entry2 in enumerate(consts[i + 1:], start=i + 1):
+                file2, name2, val2, type2, line2 = entry2
+                # Extract alphabetic tokens from names (case-insensitive)
+                tokens1 = [t.lower() for t in re.findall(r'[a-zA-Z]{4,}', name1)]
+                tokens2 = [t.lower() for t in re.findall(r'[a-zA-Z]{4,}', name2)]
+                
+                # Check for shared token
+                shared_tokens = set(tokens1) & set(tokens2)
+                if not shared_tokens:
+                    continue
+                
+                # Create edge linking the two constants
+                edge = {
+                    "kind": "constant_link",
+                    "source": {
+                        "file": file1,
+                        "name": name1,
+                        "symbol": name1,
+                        "value": value,
+                        "type": type1,
+                    },
+                    "target": {
+                        "file": file2,
+                        "name": name2,
+                        "symbol": name2,
+                        "value": value,
+                        "type": type2,
+                    },
+                    "evidence": {
+                        "file": file1,
+                        "line": line1 or line2 or 0,
+                        "excerpt": f"{name1} = {value!r} vs {name2} = {value!r}",
+                    },
+                    "origin": ORIGIN,
+                    "confidence": 1.0,
+                    "basis": "same type + equal value + shared name token (4+ chars)",
+                    "limitations": [
+                        "name overlap is not proof of shared business meaning",
+                        "structural analysis only, parsed never executed",
+                    ],
+                }
+                edges.append(edge)
+
+
 def _transition_edges(trees, index):
     """Detect guarded state transitions: a resolved method call carrying an
     UPPER_SNAKE state literal. The receiver class is resolved through the
     symbol index (chained constructor, local constructor variable, or plain
-    dotted name) — never via hardcoded fixture names."""
+    dotted name) — never via hardcoded source names."""
     edges = []
     def_lookup = {}
     for file, tree in trees.items():
@@ -728,6 +1008,8 @@ def _deep_ground_truth(files, rules, index):
     extra_edges = _transition_edges(trees, index)
     _deepen_constant_rules(trees, rules)
     rules.extend(_decision_rules(trees))
+    # Add constant links between same-type equal-value constants with shared name tokens
+    _module_constant_links(trees, extra_edges, rules)
     return extra_nodes, extra_edges
 
 
@@ -767,7 +1049,7 @@ def extract(repo, manifest=None, workspace_root=None):
         rules.extend(f_rules)
 
     index = _symbol_index(nodes)
-    deep_nodes, transition_edges = _deep_ground_truth(files, rules, index)
+    deep_nodes, extra_edges = _deep_ground_truth(files, rules, index)
 
     # Resolve call targets; emit cross-repo relation edges only between
     # qualified methods (C5: business relations are method-level; bare class
@@ -814,7 +1096,7 @@ def extract(repo, manifest=None, workspace_root=None):
             break
 
     edges.extend(relations)
-    edges.extend(transition_edges)
+    edges.extend(extra_edges)
     nodes.extend(deep_nodes)
     return nodes, edges, rules
 

@@ -75,7 +75,15 @@ class Invalidate:
         False. The store layer owns relationship-aware preservation.
         """
         return False
-def invalidate_artifact(artifact: dict[str, Any], reason: str | None = None) -> dict[str, Any]:
+_ABSENT = object()
+"""Sentinel distinguishing 'new_value not supplied' from an explicit None (a storable value)."""
+
+
+def invalidate_artifact(
+    artifact: dict[str, Any],
+    reason: str | None = None,
+    new_value: Any = _ABSENT,
+) -> dict[str, Any]:
     """Apply invalidation to an artifact and recompute affected dependents.
 
     * Marks the artifact as stale/superseded with the provided (or generated)
@@ -84,6 +92,13 @@ def invalidate_artifact(artifact: dict[str, Any], reason: str | None = None) -> 
     * Unrelated artifacts are preserved unchanged.
     * Appends invalidation decision to audit log.
     * Returns the invalidated artifact with stale status.
+
+    Amendment 2: optional ``new_value`` supplies the post-invalidation value.
+      * When omitted, behavior is unchanged (original_* captured from the
+        supplied artifact, current value preserved).
+      * When given, the returned record carries ``value=new_value`` while
+        ``original_*`` fields are captured from the supplied artifact (never
+        reconstructed). Explicit ``None`` is a storable value, not absence.
     """
     # Create a copy to avoid mutating the original
     result = dict(artifact)
@@ -107,15 +122,20 @@ def invalidate_artifact(artifact: dict[str, Any], reason: str | None = None) -> 
     # Mark as stale
     result["status"] = Status.STALE.value
 
+    # Amendment 2: explicit post-invalidation value (when supplied)
+    if new_value is not _ABSENT:
+        result["value"] = new_value
+
     # Preserve original values for history/recomputation
+    # Only set if not already set (to preserve original_value from changed artifact)
     if "original_value" not in result:
-        result["original_value"] = result.get("value")
+        result["original_value"] = artifact.get("value")
 
     if "original_condition" not in result:
-        result["original_condition"] = result.get("condition")
+        result["original_condition"] = artifact.get("condition")
 
     if "original_evidence" not in result:
-        result["original_evidence"] = result.get("evidence")
+        result["original_evidence"] = artifact.get("evidence")
 
     if "original_status" not in result:
         result["original_status"] = orig_status
