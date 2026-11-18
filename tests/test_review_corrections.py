@@ -32,7 +32,12 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from bo_api.server import create_app
-from bo_java.spring_sql_bindings import extract_guards, link_client_url
+from bo_java.spring_sql_bindings import (
+    extract_client_urls,
+    extract_guards,
+    extract_openapi,
+    link_client_url,
+)
 from bo_ontology.schema import Assertion
 from bo_ontology.store import OntologyStore
 from bo_store.provenance import init_db, record_artifact
@@ -533,3 +538,249 @@ class TestGuardPositiveContainment:
         assert parked_t["enforcement_lines"] == [], (
             f"uncontained write must cite no enforcement: {parked_t!r}"
         )
+
+
+# ---------------------------------------------------------------- variable-held URL linking
+
+
+_BILLING_BASE = "http://billing.local:8082"
+_BILLING_PATH = "/invoices/submit"
+_BILLING_URL = _BILLING_BASE + _BILLING_PATH
+
+
+def _billing_openapi(tmp_path: Path) -> dict:
+    doc = tmp_path / "openapi-billing.yaml"
+    doc.write_text(
+        "openapi: 3.0.0\n"
+        "paths:\n"
+        f"  {_BILLING_PATH}:\n"
+        "    post:\n"
+        "      operationId: submitInvoice\n",
+        encoding="utf-8",
+    )
+    ops = extract_openapi(doc)
+    assert len(ops) == 1, f"setup must yield one op: {ops!r}"
+    return ops[0]
+
+
+def _links_for_client(java_src: str, tmp_path: Path, name: str = "InvoiceClient.java"):
+    src = tmp_path / name
+    src.write_text(java_src, encoding="utf-8")
+    urls = extract_client_urls(src)
+    op = _billing_openapi(tmp_path)
+    links: list[dict] = []
+    for rec in urls:
+        links.extend(link_client_url(rec, [op]))
+    return src, urls, op, links
+
+
+class TestVariableUrlLinking:
+    """Variable-held URL (base + path concat, single assignment) linking.
+
+    Narrow pattern only: ``String <v> = "<http...>"`` or
+    ``<v> = <baseVar> + "<path>"`` where base resolves to a single
+    literal in the same file with no reassignment, used in a supported
+    invocation (postForObject/getForObject/exchange+HttpMethod) with
+    the variable reaching the call in the same method. Ambiguous
+    values, unknown calls, or unknown methods must never yield
+    compatible True. Equivalent is always False.
+    """
+
+    def test_supported_var_held_post_links_with_three_spans(self, tmp_path):
+        java = (
+            "public class InvoiceClient {\n"
+            "    private final RestTemplate restTemplate = new RestTemplate();\n"
+            f'    private String billingBaseUrl = "{_BILLING_BASE}";\n'
+            "    public void submitInvoice(Object request) {\n"
+            '        String url = billingBaseUrl + "/invoices/submit";\n'
+            "        restTemplate.postForObject(url, request, Void.class);\n"
+            "    }\n"
+            "}\n"
+        )
+        src, urls, op, links = _links_for_client(java, tmp_path)
+        lines = src.read_text(encoding="utf-8").splitlines()
+        binding = next(
+            (i + 1 for i, t in enumerate(lines) if 'billingBaseUrl + "/invoices/submit"' in t),
+            None,
+        )
+        call = next(
+            (i + 1 for i, t in enumerate(lines) if "postForObject(url" in t),
+            None,
+        )
+        assert binding is not None and call is not None, "setup must pin lines"
+        target = [r for r in urls if r.get("url") == _BILLING_URL]
+        assert target, (
+            f"variable-held URL not resolved (pre-fix: no link): {urls!r}"
+        )
+        compat = [lk for lk in links if lk.get("compatible") is True]
+        assert len(compat) == 1, f"expected one compatible POST link: {links!r}"
+        link = compat[0]
+        assert link["equivalent"] is False
+        assert link["client_path"] == _BILLING_PATH
+        # 3-span citation: binding line + invocation line + OpenAPI path+method.
+        assert link["line"] == binding, f"binding line not cited: {link!r}"
+        assert link.get("client_call_line") == call, (
+            f"invocation line not cited: {link!r}"
+        )
+        assert link["openapi_line"] == op["line"], f"openapi not cited: {link!r}"
+        reason = link.get("reason", "")
+        assert str(binding) in reason and str(call) in reason, (
+            f"reason must cite binding+call lines: {reason!r}"
+        )
+        assert "post" in reason.lower()
+
+    def test_same_path_wrong_method_stays_incompatible(self, tmp_path):
+        java = (
+            "public class InvoiceClient {\n"
+            "    private final RestTemplate restTemplate = new RestTemplate();\n"
+            f'    private String billingBaseUrl = "{_BILLING_BASE}";\n'
+            "    public String fetchInvoice(Long id) {\n"
+            '        String url = billingBaseUrl + "/invoices/submit";\n'
+            "        return restTemplate.getForObject(url, String.class);\n"
+            "    }\n"
+            "}\n"
+        )
+        _, _, _, links = _links_for_client(java, tmp_path)
+        compat = [lk for lk in links if lk.get("compatible") is True]
+        assert compat == [], f"GET vs POST must never be compatible: {links!r}"
+        for lk in links:
+            assert lk["equivalent"] is False
+            assert lk["compatible"] is False
+            assert "method" in lk.get("reason", "").lower()
+
+    def test_unused_url_constant_yields_no_compatible_link(self, tmp_path):
+        java = (
+            "public class InvoiceClient {\n"
+            "    private final RestTemplate restTemplate = new RestTemplate();\n"
+            '    private static final String UNUSED_BILLING_URL = "http://billing.local:8082/invoices/legacy";\n'
+            "    public void submitInvoice(Object request) {\n"
+            f'        String url = "http://billing.local:8082{_BILLING_PATH}";\n'
+            "    }\n"
+            "}\n"
+        )
+        _, _, _, links = _links_for_client(java, tmp_path)
+        compat = [lk for lk in links if lk.get("compatible") is True]
+        assert compat == [], f"unused constant must yield no compatible link: {links!r}"
+
+    def test_reassigned_ambiguous_url_abstains_never_picks_first(self, tmp_path):
+        java = (
+            "public class InvoiceClient {\n"
+            "    private final RestTemplate restTemplate = new RestTemplate();\n"
+            f'    private String billingBaseUrl = "{_BILLING_BASE}";\n'
+            "    public void submitAmbiguous(Object request) {\n"
+            '        String url = billingBaseUrl + "/invoices/submit";\n'
+            '        url = billingBaseUrl + "/invoices/other";\n'
+            "        restTemplate.postForObject(url, request, Void.class);\n"
+            "    }\n"
+            "}\n"
+        )
+        _, urls, _, links = _links_for_client(java, tmp_path)
+        compat = [lk for lk in links if lk.get("compatible") is True]
+        assert compat == [], (
+            f"reassigned URL must abstain, never pick first: urls={urls!r} links={links!r}"
+        )
+        for lk in links:
+            assert lk.get("compatible") is not True
+        named = [
+            lk
+            for lk in links
+            if "/invoices/submit" in str(lk.get("client_url", ""))
+            or "/invoices/other" in str(lk.get("client_url", ""))
+        ]
+        assert not any(lk.get("compatible") for lk in named), (
+            f"must NOT name either ambiguous value as compatible: {named!r}"
+        )
+
+
+# ---------------------------------------------------------------- link hardening
+
+
+class TestLinkHardening:
+    """Supported receiver + duplicate-destination ambiguity (link hardening).
+
+    Compatible True requires a supported ``RestTemplate`` receiver
+    (variable typed ``RestTemplate`` or field ``restTemplate``) and a
+    supported call (``postForObject``/``getForObject``/``exchange`` with
+    ``HttpMethod`` evidence); custom senders abstain. Duplicate
+    destinations (same path+method in >1 operation) never yield
+    compatible True (ambiguous destination).
+    """
+
+    def test_unsupported_receiver_never_compatible(self, tmp_path):
+        src = tmp_path / "UnsupportedReceiverClient.java"
+        src.write_text(
+            "public class UnsupportedReceiverClient {\n"
+            "    private final FakeSender sender = new FakeSender();\n"
+            f'    private String billingBaseUrl = "{_BILLING_BASE}";\n'
+            "    public void submitInvoice(Object request) {\n"
+            '        String url = billingBaseUrl + "/invoices/submit";\n'
+            "        sender.postForObject(url, request, Void.class);\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        urls = extract_client_urls(src)
+        target = [r for r in urls if r.get("url") == _BILLING_URL]
+        assert target, f"setup must resolve variable-held URL: {urls!r}"
+        doc = tmp_path / "openapi-hardening-billing.yaml"
+        doc.write_text(
+            "openapi: 3.0.0\n"
+            "paths:\n"
+            f"  {_BILLING_PATH}:\n"
+            "    post:\n"
+            "      operationId: submitInvoice\n",
+            encoding="utf-8",
+        )
+        ops = extract_openapi(doc)
+        assert len(ops) == 1, f"setup must yield one op: {ops!r}"
+        links: list[dict] = []
+        for rec in target:
+            links.extend(link_client_url(rec, ops))
+        assert links, "matching path must yield a link (abstain, not silence)"
+        assert not any(lk.get("compatible") is True for lk in links), (
+            f"unsupported receiver must never yield compatible True: {links!r}"
+        )
+        for lk in links:
+            assert lk["equivalent"] is False
+
+    def test_duplicate_destination_ambiguous_never_compatible(self, tmp_path):
+        src = tmp_path / "DuplicateDestClient.java"
+        src.write_text(
+            "public class DuplicateDestClient {\n"
+            "    private final RestTemplate restTemplate = new RestTemplate();\n"
+            f'    private String billingBaseUrl = "{_BILLING_BASE}";\n'
+            "    public void submitInvoice(Object request) {\n"
+            '        String url = billingBaseUrl + "/invoices/submit";\n'
+            "        restTemplate.postForObject(url, request, Void.class);\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        urls = extract_client_urls(src)
+        target = [r for r in urls if r.get("url") == _BILLING_URL]
+        assert target, f"setup must resolve variable-held URL: {urls!r}"
+        ops: list[dict] = []
+        for name in ("openapi-hardening-alpha.yaml", "openapi-hardening-gamma.yaml"):
+            doc = tmp_path / name
+            doc.write_text(
+                "openapi: 3.0.0\n"
+                "paths:\n"
+                f"  {_BILLING_PATH}:\n"
+                "    post:\n"
+                f"      operationId: submit-{name}\n",
+                encoding="utf-8",
+            )
+            ops.extend(extract_openapi(doc))
+        assert len(ops) == 2, f"setup must yield two duplicate ops: {ops!r}"
+        links: list[dict] = []
+        for rec in target:
+            links.extend(link_client_url(rec, ops))
+        assert len(links) == 2, f"duplicate destinations must both link: {links!r}"
+        assert not any(lk.get("compatible") is True for lk in links), (
+            f"duplicate destination must never yield compatible True: {links!r}"
+        )
+        for lk in links:
+            assert lk["equivalent"] is False
+            assert "ambiguous" in str(lk.get("reason", "")).lower(), (
+                f"duplicate destination must cite ambiguity: {lk!r}"
+            )

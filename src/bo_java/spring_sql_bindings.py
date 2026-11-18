@@ -48,17 +48,128 @@ _METHOD_LINE = re.compile(r"^\s{4}(get|post|put|delete|patch|options|head)\s*:\s
 _CREATE_TABLE = re.compile(r"(?i)^\s*CREATE\s+TABLE\s+([A-Za-z_][\w]*)\s*\(?\s*$")
 _COLUMN_LINE = re.compile(r"^\s*([A-Za-z_][\w]*)\s+([A-Za-z_][\w()<>, \t]*)\s*(.*)$")
 _CLIENT_URL = re.compile(r'https?://[^"\s\)]+')
+_REST_TEMPLATE_DECL = re.compile(r"\bRestTemplate\s+([A-Za-z_][\w]*)")
 _CALL_METHOD_HINTS = (
     ("postForObject", "post"),
-    ("postForEntity", "post"),
     ("getForObject", "get"),
-    ("getForEntity", "get"),
-    ("patchForObject", "patch"),
-    ("headForHeaders", "head"),
-    ("optionsForAllow", "options"),
 )
 _URL_VAR = re.compile(r'\b([A-Za-z_][\w]*)\s*=\s*["\']https?://')
 _HTTP_METHOD = re.compile(r"HttpMethod\.([A-Za-z]+)")
+_CONCAT_ASSIGN = re.compile(
+    r'\b([A-Za-z_][\w]*)\s*=\s*([A-Za-z_][\w]*)\s*\+\s*["\'](/[^"\']*)["\']'
+)
+_VALUE_DEFAULT = re.compile(r'@Value\([^)]*:(https?://[^}"\'\s\)]+)')
+
+
+def _resolve_base_literal(lines: list[str], base: str) -> str | None:
+    """Single-literal base value for ``base`` in the same file.
+
+    Collects direct ``base = "http..."`` assignments plus ``@Value``
+    defaults (``@Value("...:http...")`` with ``base`` declared within
+    the next two lines). Returns the literal only when exactly one
+    assignment exists; otherwise None (ambiguous/unknown: abstain).
+    """
+    vals: list[str] = []
+    direct = re.compile(r"\b" + re.escape(base) + r"\s*=\s*[\"'](https?://[^\"']*)[\"']")
+    for line in lines:
+        match = direct.search(line)
+        if match:
+            vals.append(match.group(1))
+    for idx, line in enumerate(lines):
+        vm = _VALUE_DEFAULT.search(line)
+        if not vm:
+            continue
+        lit = vm.group(1)
+        for ahead in range(idx, min(idx + 3, len(lines))):
+            if re.search(r"\b" + re.escape(base) + r"\b", lines[ahead]):
+                vals.append(lit)
+                break
+    if len(vals) != 1:
+        return None
+    return vals[0]
+
+
+def _infer_client_method_and_line(
+    url_record: dict[str, Any],
+) -> tuple[str | None, int | None]:
+    """Method plus invocation line for a client-URL record.
+
+    The variable must reach a supported call (postForObject/
+    getForObject/exchange+HttpMethod, ...) in the same method
+    (data-flow by name); otherwise (None, None) or (None, call line)
+    for unknown-method candidates (never compatible True).
+
+    Hardening: the call receiver must be a supported ``RestTemplate``
+    receiver -- a variable typed ``RestTemplate`` in the same file or
+    the conventional field ``restTemplate`` (so ``<recv>.postForObject``/
+    ``<recv>.getForObject``/``<recv>.exchange`` only counts when
+    ``recv`` is allowlisted). Unsupported receivers (e.g. a custom
+    ``FakeSender.postForObject``) never yield a method (abstain).
+    """
+    try:
+        lines = Path(url_record["file"]).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None, None
+    url = url_record.get("url", "")
+    var: str | None = url_record.get("var")
+    lineno = url_record.get("line")
+    if not var and isinstance(lineno, int) and 1 <= lineno <= len(lines):
+        match = _URL_VAR.search(lines[lineno - 1])
+        if match:
+            var = match.group(1)
+        else:
+            cm = _CONCAT_ASSIGN.search(lines[lineno - 1])
+            if cm:
+                var = cm.group(1)
+
+    def _reaches(text: str) -> bool:
+        if url and url in text:
+            return True
+        return bool(var) and re.search(r"\b" + re.escape(var) + r"\b", text) is not None
+
+    allowed: set[str] = {"restTemplate"}
+    for _line in lines:
+        for _m in _REST_TEMPLATE_DECL.finditer(_line):
+            allowed.add(_m.group(1))
+
+    def _recv_ok(text: str, call: str) -> bool:
+        for recv in allowed:
+            if re.search(
+                r"\b" + re.escape(recv) + r"\s*\.\s*" + re.escape(call) + r"\s*\(",
+                text,
+            ):
+                return True
+        return False
+
+    scoped: list[tuple[int, str]] = [(i + 1, t) for i, t in enumerate(lines)]
+    if isinstance(lineno, int) and var:
+        try:
+            bodies = _method_bodies(Path(url_record["file"]))
+        except (OSError, UnicodeError):
+            bodies = []
+        for body in bodies:
+            start = body["base"]
+            end = body["base"] + len(body["lines"]) - 1
+            if start <= lineno <= end:
+                scoped = [
+                    (start + off, text) for off, text in enumerate(body["lines"])
+                ]
+                break
+
+    for num, text in scoped:
+        if "exchange(" in text and _reaches(text):
+            if not _recv_ok(text, "exchange"):
+                continue
+            method = _HTTP_METHOD.search(text)
+            if method:
+                return method.group(1).lower(), num
+            return None, num
+        for hint, method in _CALL_METHOD_HINTS:
+            if hint + "(" in text and _reaches(text):
+                if not _recv_ok(text, hint):
+                    continue
+                return method, num
+    return None, None
 
 
 def _infer_client_method(url_record: dict[str, Any]) -> str | None:
@@ -69,36 +180,8 @@ def _infer_client_method(url_record: dict[str, Any]) -> str | None:
     (``postForObject``/``getForObject``/``exchange`` with an explicit
     ``HttpMethod``, ...); otherwise None (abstain: unknown method).
     """
-    try:
-        lines = Path(url_record["file"]).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return None
-    url = url_record.get("url", "")
-    var: str | None = None
-    lineno = url_record.get("line")
-    if isinstance(lineno, int) and 1 <= lineno <= len(lines):
-        match = _URL_VAR.search(lines[lineno - 1])
-        if match:
-            var = match.group(1)
-
-    def _reaches(text: str) -> bool:
-        if url and url in text:
-            return True
-        return bool(var) and re.search(r"\b" + re.escape(var) + r"\b", text) is not None
-
-    for text in lines:
-        if "exchange(" in text and _reaches(text):
-            method = _HTTP_METHOD.search(text)
-            return method.group(1).lower() if method else None
-        for hint, method in _CALL_METHOD_HINTS:
-            if hint + "(" in text and _reaches(text):
-                return method
-        put_delete = re.search(
-            r"\brestTemplate\s*\.\s*(put|delete)\s*\(", text, re.IGNORECASE
-        )
-        if put_delete is not None and _reaches(text):
-            return put_delete.group(1).lower()
-    return None
+    method, _ = _infer_client_method_and_line(url_record)
+    return method
 
 
 def _content_hash(path: Path) -> str:
@@ -259,15 +342,56 @@ def extract_openapi(path: Path) -> list[dict[str, Any]]:
 
 
 def extract_client_urls(path: Path) -> list[dict[str, Any]]:
-    """HTTP(S) client URLs found in a source file (with the line they appear on)."""
+    """HTTP(S) client URLs found in a source file (with the line they appear on).
+
+    Also resolves narrow variable-held URLs: ``String <v> = "<http...>"``
+    is covered by the literal scan, plus ``<v> = <base> + "<path>"``
+    where ``base`` resolves to a single literal in the same file with
+    no reassignment. The concat binding line becomes the record line;
+    ambiguous values (multiple assignments/reassigned/unknown base)
+    are skipped (abstain, never guess).
+    """
     records: list[dict[str, Any]] = []
     text = path.read_text(encoding="utf-8")
-    for index, line in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    for index, line in enumerate(lines, start=1):
         for match in _CLIENT_URL.finditer(line):
             records.append({
                 **_base(path, index),
                 "kind": "client_url",
                 "url": match.group(0),
+                "span": {"start_line": index, "end_line": index},
+            })
+    try:
+        bodies = _method_bodies(path)
+    except (OSError, UnicodeError):
+        return records
+    for index, line in enumerate(lines, start=1):
+        for cm in _CONCAT_ASSIGN.finditer(line):
+            var, base, suffix = cm.group(1), cm.group(2), cm.group(3)
+            enclosing: dict[str, Any] | None = None
+            for body in bodies:
+                start = body["base"]
+                end = body["base"] + len(body["lines"]) - 1
+                if start <= index <= end:
+                    enclosing = body
+                    break
+            if enclosing is None:
+                continue
+            assign = re.compile(r"\b" + re.escape(var) + r"\s*=")
+            if sum(1 for t in enclosing["lines"] if assign.search(t)) != 1:
+                continue
+            lit = _resolve_base_literal(lines, base)
+            if lit is None:
+                continue
+            full = lit.rstrip("/") + suffix
+            if not urlparse(full).path.startswith("/"):
+                continue
+            records.append({
+                **_base(path, index),
+                "kind": "client_url",
+                "url": full,
+                "var": var,
                 "span": {"start_line": index, "end_line": index},
             })
     return records
@@ -704,20 +828,41 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
     Compatible only when the client URL path matches an OpenAPI path *and*
     the client method matches the OpenAPI operation method (the client
     method rides on the URL record, or is inferred trivially from
-    ``postForObject``/``getForObject``/``exchange`` call sites; unknown
+    ``postForObject``/``getForObject``/``exchange`` call sites via a
+    supported ``RestTemplate`` receiver; unknown
     method abstains via ``candidate-needs-method``). An unused URL whose
-    path matches nothing yields no links. Equivalent is never true (client
+    path matches nothing yields no links. Duplicate destinations
+    (same path+method in >1 operation) never yield compatible True
+    (ambiguous destination: abstain/candidate). Equivalent is never true (client
     URL carries scheme+host, OpenAPI path is path-only).
     """
     links: list[dict[str, Any]] = []
     client_path = urlparse(url_record["url"]).path
     explicit = url_record.get("method")
+    inferred_method, call_line = _infer_client_method_and_line(url_record)
     if explicit is not None and str(explicit).strip() != "":
         client_method: str | None = str(explicit).strip().lower()
     else:
-        client_method = _infer_client_method(url_record)
+        client_method = inferred_method
+    call_text: str | None = None
+    if isinstance(call_line, int):
+        try:
+            call_text = Path(url_record["file"]).read_text(encoding="utf-8").splitlines()[call_line - 1].strip()
+        except (OSError, UnicodeError, IndexError):
+            call_text = None
     if not any(op.get("openapi_path") == client_path for op in openapi_records):
         return []
+    dup_count = 0
+    if client_method is not None:
+        for _op in openapi_records:
+            _m = _op.get("method")
+            _norm = (
+                str(_m).strip().lower()
+                if _m is not None and str(_m).strip() != ""
+                else None
+            )
+            if _op.get("openapi_path") == client_path and _norm == client_method:
+                dup_count += 1
     base = {
         **_base(Path(url_record["file"]), url_record["line"]),
         "kind": "contract_link",
@@ -725,6 +870,8 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
         "client_path": client_path,
         "compatible": False,
         "equivalent": False,
+        "client_call_line": call_line,
+        "client_call": call_text,
         "span": {
             "start_line": url_record["line"],
             "end_line": url_record["line"],
@@ -750,11 +897,28 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
         link["compatible"] = bool(path_match and method_match)
         link["equivalent"] = False
         never_equiv = "equivalent never true (client URL carries scheme+host, OpenAPI path is path-only)"
-        if link["compatible"]:
+        if dup_count > 1 and path_match and method_match:
+            link["compatible"] = False
             link["reason"] = (
-                f"compatible contract: client path {client_path} == openapi path {op['openapi_path']} "
-                f"and method {client_method} == {op_method_norm}; {never_equiv}"
+                f"ambiguous destination: {dup_count} operations share path {client_path} "
+                f"and method {client_method}; abstain, no verified compatible link "
+                f"(candidate, duplicate destination); {never_equiv}"
             )
+        elif link["compatible"]:
+            op_path_line = op.get("span", {}).get("start_line", op["line"]) if isinstance(op.get("span"), dict) else op["line"]
+            binding_line = url_record["line"]
+            if call_line is not None:
+                link["reason"] = (
+                    f"compatible contract: client path {client_path} == openapi path {op['openapi_path']} "
+                    f"and method {client_method} == {op_method_norm}; "
+                    f"binding L{binding_line} + call L{call_line} + openapi path L{op_path_line} + method L{op['line']}; {never_equiv}"
+                )
+            else:
+                link["reason"] = (
+                    f"compatible contract: client path {client_path} == openapi path {op['openapi_path']} "
+                    f"and method {client_method} == {op_method_norm}; "
+                    f"binding L{binding_line} + openapi path L{op_path_line} + method L{op['line']}; {never_equiv}"
+                )
         elif path_match:
             if client_method is None or op_method_norm is None:
                 link["reason"] = (
