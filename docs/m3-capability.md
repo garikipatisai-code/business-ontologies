@@ -58,3 +58,13 @@ M3C implements alignment module + read-only views + server mount + verify_m3 gat
 - **M3A suites**: will run post‑implementation
 - **M3B protocol**: mock‑only, all tests pass
 - **verify_m3 gate**: will enforce full gate compliance
+
+## Java Slice (J1–J6)
+- **scope**: two synthetic Java fixtures (java-repo-a refund, java-repo-b orders), independent ground truth, Java adapter over the pinned fallback backend, Spring/SQL bindings, business-knowledge tests, verify gate, docs.
+- **backend**: code-graph-rag reuse FAILS (`code_graph_rag` module absent; install needs downloads outside the allowance); fallback pair `javaparser-core 3.17.0` + `symbol-solver-core 3.17.0` (Apache-2.0, Maven Central) used; adapter compiles/runs a javaparser dump tool against `javaparser-core-3.17.0.jar` only. Tooling: Java 26.0.1 + `javac` 26.0.1 + Apache Maven 3.9.16 (plan named JDK 17 — deviation: no JDK 17 installed, so Java 26 used).
+- **adapter**: `JavaAdapter.index()` whole-program resolves definitions/callers/callees across both repos; `unresolved()` explicitly lists the dynamic `getMethod(hookName)`/`invoke` probe (never a resolved callee); re-index/re-resolve byte-identical.
+- **bindings** (`spring_sql_bindings`, stdlib only): annotations (`@PostMapping("/refunds)`, `@RestController`, `@Service`, `@Transactional`), YAML policy via text scan (`window-days=30`, `default-status=CREATED`), SQL persistence (`refunds` table), OpenAPI operations, client URL `http://refund-service.local/refunds` → contract link `compatible=True, equivalent=False` vs repo-a `POST /refunds`; rejected mapping vs repo-b `/orders/{orderId}/refund` (insufficiency: path mismatch, `equivalent=False`).
+- **business slice**: Refund/Order concepts scoped per repo; window-guard rule with enforcement lines (guard-if body lines, not declarations); guarded transition to `REFUND_REQUESTED`; unresolved dynamic `hookName` with reason; rejected mapping with insufficiency; epistemic labels `static`/`configured` present, `observed` absent.
+- **gate**: `scripts/verify_java_slice.py` — full pytest + 3 Java suites + byte-identical check on `verify_m1/m2/m3.py` vs `c00c834` + honesty block; exits non-zero on any red. **GATE PASS (7/7)**.
+- **limitations**: JDK deviation (17 named, 26 used); stdlib YAML text-scan (no parser); single fixture pair; no observed runtime.
+- **compliance**: Python-only slice code plus pinned Maven jars; no new Python deps; no commit/push; no edits to M1/M2/M3 graders or frozen seals.

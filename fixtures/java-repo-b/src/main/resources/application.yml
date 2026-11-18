@@ -1,0 +1,5 @@
+order:
+  prefix: "ORD"
+  default-status: "CREATED"
+  client:
+    timeout-ms: 2000

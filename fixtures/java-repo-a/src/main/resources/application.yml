@@ -1,0 +1,3 @@
+refund:
+  window-days: 30
+  window-days-display: "Refund window shown as 30 days in UI"
