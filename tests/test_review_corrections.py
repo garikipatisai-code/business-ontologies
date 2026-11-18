@@ -475,3 +475,61 @@ class TestGuardOptionalBranch:
         assert top_t["guard"] == "isOk"
         assert top_t["guard_if_line"] is not None
         assert top_t["guard_if_line"] < top_t["line"]
+
+# ---------------------------------------------------------------- positive-branch containment
+
+_WPOS = """\
+public class WidgetService {
+    void approveWidget(Widget widget) {
+        if (widget.getState() == WidgetState.PENDING) {
+            widget.setWidgetStatus(WidgetState.ACTIVE);
+        }
+    }
+    void parkWidget(Widget widget, boolean ready) {
+        if (ready) {
+            System.out.println("ready");
+        }
+        widget.setWidgetStatus(WidgetState.PARKED);
+    }
+}
+"""
+
+
+class TestGuardPositiveContainment:
+    """A write INSIDE a guard's then-block is governed by that guard.
+
+    Containment (guard_if < write <= guard_end with the write's parent
+    block equal to the guard's then-block) governs; a preceding
+    same-block ``if`` that does not contain the write must NOT be
+    claimed as governing (no mere-co-occurrence attribution).
+    """
+
+    def test_contained_write_guarded_noncontaining_preceding_abstains(
+        self, tmp_path
+    ):
+        src = tmp_path / "WidgetService.java"
+        src.write_text(_WPOS, encoding="utf-8")
+        enforced, transitions = extract_guards(src)
+        assert enforced == [], (
+            f"positive containment must not synthesize enforced rules: {enforced!r}"
+        )
+        by_status = {t["target_status"]: t for t in transitions}
+        assert {"ACTIVE", "PARKED"} <= set(by_status), (
+            f"expected ACTIVE + PARKED transitions: {transitions!r}"
+        )
+
+        active_t = by_status["ACTIVE"]
+        assert active_t["guard"] == "widget.getState() == WidgetState.PENDING"
+        assert active_t["guard_if_line"] is not None
+        assert active_t["guard_if_line"] < active_t["line"]
+        assert active_t["guard_if_line"] in active_t["enforcement_lines"], (
+            f"contained write must cite its guard: {active_t!r}"
+        )
+
+        parked_t = by_status["PARKED"]
+        assert parked_t["guard"] is None, (
+            f"non-containing preceding if must not govern: {parked_t!r}"
+        )
+        assert parked_t["enforcement_lines"] == [], (
+            f"uncontained write must cite no enforcement: {parked_t!r}"
+        )

@@ -307,7 +307,10 @@ _RETURN_STMT = re.compile(r"^\s*return\s+([^;]+?)\s*;")
 _COMPARE = re.compile(r"\b([A-Za-z_][\w]*)\s*(<=|>=|==|<|>)\s*([A-Za-z_][\w]*)")
 _THROW = re.compile(r"\bthrow\b")
 _FALSE_RETURN = re.compile(r"\breturn\s+false\b")
-_SET_STATUS = re.compile(r"\.set[A-Z]\w*Status\(\s*\"([^\"]*)\"\s*\)")
+_SET_STATUS = re.compile(
+    r"\.set\w*Status\(\s*(?:\"([^\"]*)\""
+    r"|([A-Z][A-Z0-9_]*(?:\.[A-Za-z_][\w]*)*|(?:[A-Za-z_][\w]*\.)+[A-Za-z_][\w]*))\s*\)"
+)
 
 
 def _method_bodies(path: Path) -> list[dict[str, Any]]:
@@ -361,6 +364,107 @@ def _method_bodies(path: Path) -> list[dict[str, Any]]:
     return bodies
 
 
+def _then_block(
+    offset: int,
+    match_end: int,
+    line: str,
+    lines: list[str],
+    base: int,
+    stack_before: list[tuple],
+) -> tuple[tuple, tuple, int] | None:
+    """Braced then-block opened by the ``if`` starting on body line *offset*.
+
+    Returns ``(then_key, guard_parent, end_line)``: ``then_key`` is the
+    pushed-block id that a directly-contained statement's enclosing-block
+    key ends with, ``guard_parent`` the enclosing-block key at the ``if``,
+    and ``end_line`` (1-based) the closing-brace line. Returns None for
+    unbraced single-statement ``if``s (abstain: no block to contain a
+    write) or when no opener is found.
+    """
+    pos = match_end - 1  # index of the '(' in 'if ('
+    depth = 0
+    close: int | None = None
+    for j in range(pos, len(line)):
+        ch = line[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close = j
+                break
+    if close is None:
+        return None
+    brace_line: int | None = None
+    brace_col = 0
+    k = line.find("{", close + 1)
+    if k != -1:
+        brace_line, brace_col = offset, k
+    else:
+        for ahead in range(1, 4):
+            nxt = offset + ahead
+            if nxt >= len(lines):
+                break
+            text = lines[nxt]
+            if not text.strip():
+                continue
+            open_idx = text.find("{")
+            semi_idx = text.find(";")
+            if open_idx == -1 or (semi_idx != -1 and semi_idx < open_idx):
+                return None
+            brace_line, brace_col = nxt, open_idx
+            break
+        if brace_line is None:
+            return None
+    assert brace_line is not None
+    eff: list = list(stack_before[offset])
+    seq: list[tuple[int, str]] = []
+    if brace_line == offset:
+        seq = [(offset, line[:brace_col])]
+    else:
+        seq = [(offset, line)]
+        for mid in range(offset + 1, brace_line):
+            seq.append((mid, lines[mid]))
+        seq.append((brace_line, lines[brace_line][:brace_col]))
+    for _idx, prefix in seq:
+        for ch in prefix:
+            if ch == "{":
+                eff.append((_idx, len(eff)))
+            elif ch == "}":
+                if len(eff) > 1:
+                    eff.pop()
+    then_key = (brace_line, len(eff))
+    guard_parent = tuple(eff)
+    stack: list = list(eff)
+    stack.append(then_key)
+    target = len(stack)
+    rest: list[tuple[int, str]] = []
+    if brace_line == offset:
+        rest.append((offset, line[brace_col + 1:]))
+        start = offset + 1
+    else:
+        rest.append((brace_line, lines[brace_line][brace_col + 1:]))
+        start = brace_line + 1
+    for idx in range(start, len(lines)):
+        rest.append((idx, lines[idx]))
+    end_line = base + len(lines) - 1
+    for idx, text in rest:
+        closed = False
+        for ch in text:
+            if ch == "{":
+                stack.append(("nested", idx))
+            elif ch == "}":
+                if len(stack) > 1:
+                    stack.pop()
+                if len(stack) < target:
+                    end_line = base + idx
+                    closed = True
+                    break
+        if closed:
+            break
+    return then_key, guard_parent, end_line
+
+
 def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Enforced rules and guarded transitions from Java method bodies.
 
@@ -369,11 +473,16 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
     age/vs-window comparison like ``days <= windowDays`` when present,
     otherwise the guard-if test), the failure outcome, and enforcement lines
     citing the guard-if body lines plus any compared-return line. Each status
-    change (``set*Status(...)``) guarded by a *preceding* enforced rule in
-    the same body becomes a transition record naming that nearest-prior
-    guard and citing its enforcement lines; an unguarded write (no prior
-    enforced guard, guard-after-write only) carries ``guard None`` with
-    empty enforcement -- no guard is synthesized.
+    change (``set*Status(...)`` with a quoted literal or an enum/constant
+    argument) guarded by a *preceding* enforced rule in the same body
+    becomes a transition record naming that nearest-prior guard and citing
+    its enforcement lines; a write *contained* in a guard's braced
+    then-block (guard_if < write <= guard end, write parent == then-block)
+    is governed by that guard's full condition even without a
+    throw/return-false. An unguarded write (no prior enforced guard and no
+    containing guard, guard-after-write only) carries ``guard None`` with
+    empty enforcement -- no guard is synthesized, and a preceding
+    same-block ``if`` that does not contain the write never governs it.
     """
     enforced: list[dict[str, Any]] = []
     transitions: list[dict[str, Any]] = []
@@ -429,6 +538,7 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                     condition = f"{compare.group(1)} {compare.group(2)} {compare.group(3)}"
                     condition_line = base + offset
         body_guards: list[dict[str, Any]] = []
+        body_positive: list[dict[str, Any]] = []
         for offset, line in enumerate(lines):
             guard = _IF_OPEN.search(line)
             if not guard:
@@ -442,6 +552,20 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
             guard_depth_scan = depth_at[offset] if offset < len(depth_at) else None
             if guard_depth is None or guard_depth_scan is None:
                 continue
+            stripped_condition = condition_text.strip()
+            if stripped_condition:
+                then = _then_block(
+                    offset, guard.end(), line, lines, base, stack_before
+                )
+                if then is not None:
+                    then_key, then_parent, then_end = then
+                    body_positive.append({
+                        "condition": stripped_condition,
+                        "guard_if_line": guard_line,
+                        "guard_parent": guard_parent,
+                        "then_key": then_key,
+                        "guard_end_line": then_end,
+                    })
             indent = len(line) - len(line.lstrip())
             failure: str | None = None
             failure_line: int | None = None
@@ -524,9 +648,34 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
             status = _SET_STATUS.search(line)
             if not status:
                 continue
+            if status.group(1) is not None:
+                target = status.group(1)
+            else:
+                target = status.group(2).split(".")[-1]
             status_line = base + offset
             write_parent = _parent_at(offset, status.start(), line)
             write_depth = len(write_parent)
+            contained = None
+            for pg in body_positive:
+                if (
+                    pg["guard_if_line"] < status_line <= pg["guard_end_line"]
+                    and len(write_parent) == len(pg["guard_parent"]) + 1
+                    and write_parent[-1] == pg["then_key"]
+                    and tuple(write_parent[:-1]) == pg["guard_parent"]
+                ):
+                    contained = pg
+                    break
+            if contained is not None:
+                transitions.append({
+                    **_base(path, status_line),
+                    "kind": "transition",
+                    "target_status": target,
+                    "guard": contained["condition"],
+                    "guard_if_line": contained["guard_if_line"],
+                    "enforcement_lines": [contained["guard_if_line"]],
+                    "span": {"start_line": status_line, "end_line": status_line},
+                })
+                continue
             prior = [
                 g
                 for g in body_guards
@@ -540,7 +689,7 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
             transitions.append({
                 **_base(path, status_line),
                 "kind": "transition",
-                "target_status": status.group(1),
+                "target_status": target,
                 "guard": best["guard"] if best is not None else None,
                 "guard_if_line": best["guard_if_line"] if best is not None else None,
                 "enforcement_lines": list(best["enforcement_lines"]) if best is not None else [],
