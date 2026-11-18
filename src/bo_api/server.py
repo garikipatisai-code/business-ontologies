@@ -147,6 +147,103 @@ def _subject_param(parsed):
     return subject if subject else None
 
 
+def _demo_opted_in(parsed):
+    """Explicit demo opt-in for /m3/* fixture views (?demo=1 or env)."""
+    try:
+        values = urllib.parse.parse_qs(parsed.query).get("demo")
+        if values and values[0].strip().lower() in ("1", "true", "yes"):
+            return True
+    except Exception:
+        pass
+    for env_key in ("BO_M3_DEMO", "BO_DEMO", "BO_API_DEMO"):
+        try:
+            if os.environ.get(env_key, "").strip().lower() in ("1", "true", "yes"):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _labeled_unfiltered(rows, filt, reason):
+    """Legacy/unfiltered envelope: never a silent all-rows list."""
+    return {
+        "data": rows,
+        "filter": filt,
+        "legacy": True,
+        "unfiltered": True,
+        "reason": reason,
+    }
+
+
+def _apply_column_filter(rows, column, value):
+    """In-Python equality filter on an existing provenance column.
+
+    Returns (True, filtered) when *column* exists; (False, rows) when the
+    column is unknown so the caller can label instead of silently dumping
+    all rows.
+    """
+    if not rows:
+        return True, []
+    if column not in rows[0].keys():
+        return False, rows
+    return True, [r for r in rows if str(r.get(column)) == str(value)]
+
+
+def _typed_filter_params(parsed):
+    """Collect explicit typed-filter query params (excluding ?repo=)."""
+    qs = urllib.parse.parse_qs(parsed.query)
+    out = {}
+    for key in ("origin", "status", "kind", "subject"):
+        try:
+            vals = qs.get(key)
+        except Exception:
+            vals = None
+        if vals and vals[0]:
+            out[key] = vals[0]
+    return out
+
+
+def _LEGACY_BULK_HEADERS():
+    """Header labels for /rules + /relations raw-list legacy bulk exports."""
+    return {
+        "X-Legacy-Bulk-Export": "true",
+        "X-Filter-Status": "unfiltered-legacy",
+    }
+
+
+def _send_typed(handler, rows, filt, default_unfiltered_label, extra_headers=None):
+    """Send filtered rows, or a labeled legacy/unfiltered envelope.
+
+    *filt* maps column -> wanted value. Unknown columns (e.g. ``kind`` /
+    ``subject``, which are not provenance columns) yield a labeled
+    envelope, never a silent all-rows list. Empty *filt* returns the
+    repo-scoped rows unchanged unless *default_unfiltered_label* forces
+    an explicit label.
+
+    *extra_headers* (e.g. legacy bulk-export labels) is sent only with a
+    raw-list body; labeled envelopes already carry their label in-band.
+    """
+    if not filt:
+        if default_unfiltered_label:
+            handler._send_json(
+                _labeled_unfiltered(rows, None, default_unfiltered_label)
+            )
+        else:
+            handler._send_json(rows, extra_headers=extra_headers)
+        return
+    filtered = list(rows)
+    for column, value in filt.items():
+        ok, filtered = _apply_column_filter(filtered, column, value)
+        if not ok:
+            handler._send_json(
+                _labeled_unfiltered(
+                    rows, filt, "unknown-filter-column:%s" % column
+                )
+            )
+            return
+    handler._send_json(filtered)
+
+
 def create_app(db_path):
     """Return a read-only request handler class bound to *db_path*."""
     # Ensure schema exists up front.
@@ -159,11 +256,13 @@ def create_app(db_path):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def _send_json(self, obj, status=200):
+        def _send_json(self, obj, status=200, extra_headers=None):
             data = json.dumps(obj, default=str).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            for _hk, _hv in (extra_headers or {}).items():
+                self.send_header(_hk, _hv)
             self.end_headers()
             try:
                 self.wfile.write(data)
@@ -209,65 +308,139 @@ def create_app(db_path):
                 self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
                 return
             if path == "/rules":
-                # Rules: provenance artifacts carrying a rule origin (deterministic /
-                # model-inferred / human-reviewed). M1 returns provenance artifacts;
-                # the origin/refund_window split is enforced at ingest and exposed
-                # here via ?repo=, with a full kind-based split deferred to M2.
-                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                # Rules: provenance artifacts scoped by ?repo=, with optional
+                # in-Python equality filters (?origin=/?status=). Unfiltered
+                # raw list is advertised bulk-export behavior (parity with
+                # /evidence); unknown filter columns yield a labeled
+                # legacy/unfiltered envelope, never a silent all-rows list.
+                # Legacy bulk-export: unfiltered raw list bodies are labeled
+                # via response headers only (body stays a bare list).
+                _send_typed(
+                    self,
+                    _fetch_all(self.db_path, repo=_repo_param(parsed)),
+                    _typed_filter_params(parsed),
+                    None,
+                    _LEGACY_BULK_HEADERS(),
+                )
                 return
             if path == "/relations":
                 # Relations: cross-repo invocation edges persisted as provenance
-                # artifacts (kind "invokes"). M1 returns provenance artifacts;
-                # the invokes filter is deferred to M2, scoped here by ?repo=.
-                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                # artifacts. Scoped by ?repo=, with optional in-Python equality
+                # filters. Unfiltered raw list is advertised bulk-export
+                # behavior (parity with /evidence); unknown columns yield a
+                # labeled envelope, never a silent all-rows list.
+                # Legacy bulk-export: unfiltered raw list bodies are labeled
+                # via response headers only (body stays a bare list).
+                _send_typed(
+                    self,
+                    _fetch_all(self.db_path, repo=_repo_param(parsed)),
+                    _typed_filter_params(parsed),
+                    None,
+                    _LEGACY_BULK_HEADERS(),
+                )
                 return
             if path == "/status":
-                # Review status: all provenance artifacts carrying a review origin
-                # (deterministic / model-inferred / human-reviewed). M1 returns
-                # provenance artifacts; the status filter is deferred to M2.
-                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                # Review status: ?status= honored via in-Python equality
+                # filtering; a missing status/origin filter yields a labeled
+                # legacy/unfiltered envelope, never silent all-rows. Extra
+                # typed params (e.g. ?kind=/?subject=) are forwarded so they
+                # label as unknown-filter-column instead of being dropped.
+                filt = _typed_filter_params(parsed)
+                if "status" not in filt and "origin" not in filt:
+                    _send_typed(
+                        self,
+                        _fetch_all(self.db_path, repo=_repo_param(parsed)),
+                        filt,
+                        "missing-status-filter",
+                    )
+                    return
+                _send_typed(
+                    self,
+                    _fetch_all(self.db_path, repo=_repo_param(parsed)),
+                    filt,
+                    None,
+                )
                 return
             if path == "/conflicts":
-                # Evidence conflicts: all provenance artifacts with status "disputed".
-                # The status filter is deferred to M2, scoped here by ?repo=.
-                # For now, return all artifacts (filtering will be applied in M2).
-                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                # Evidence conflicts: only provenance artifacts with status
+                # "disputed" (plus ?repo= scoping). Never silent all-rows:
+                # a missing status column yields a labeled envelope.
+                rows = _fetch_all(self.db_path, repo=_repo_param(parsed))
+                ok, rows = _apply_column_filter(rows, "status", "disputed")
+                if not ok:
+                    self._send_json(
+                        _labeled_unfiltered(
+                            rows, {"status": "disputed"}, "unknown-filter-column:status"
+                        )
+                    )
+                    return
+                extra = _typed_filter_params(parsed)
+                extra.pop("status", None)
+                if extra:
+                    _send_typed(self, rows, extra, None)
+                    return
+                self._send_json(rows)
                 return
             if path == "/history":
-                # Review history: all provenance artifacts with review origin.
-                # The review filter is deferred to M2, scoped here by ?repo=.
-                # For now, return all artifacts (filtering will be applied in M2).
-                self._send_json(_fetch_all(self.db_path, repo=_repo_param(parsed)))
+                # Review history: provenance artifacts scoped by ?repo=, with
+                # optional in-Python equality filters; unfiltered responses
+                # carry a legacy/unfiltered label.
+                _send_typed(
+                    self,
+                    _fetch_all(self.db_path, repo=_repo_param(parsed)),
+                    _typed_filter_params(parsed),
+                    "missing-review-filter",
+                )
                 return
-            # M3 read-only views (mount-only, no write verbs)
+            # M3 read-only views (mount-only, no write verbs). Fixture-backed
+            # demo data is served only under explicit opt-in (?demo=1 or
+            # BO_M3_DEMO/BO_DEMO/BO_API_DEMO env); the default for an
+            # arbitrary temp-db app is abstain, never a fixture leak.
             if path == "/m3/concepts":
                 # M3 concepts view: from heuristic extraction (C1)
+                if not _demo_opted_in(parsed):
+                    self._abstain(404)
+                    return
                 try:
                     from bo_extract.heuristic_concepts import discover
                     concepts = discover(["fixtures/repo-d", "fixtures/repo-b"])
-                    self._send_json(concepts)
+                    self._send_json(
+                        {"demo": True, "origin": "fixture-demo", "data": concepts}
+                    )
                 except Exception as e:
                     self._send_json({"status": "error", "reason": str(e)}, status=500)
                 return
             if path == "/m3/alignment":
                 # M3 alignment view: typed mappings (C2)
+                if not _demo_opted_in(parsed):
+                    self._abstain(404)
+                    return
                 try:
                     from bo_ontology.alignment import align
                     from bo_extract.heuristic_concepts import discover
-                    concepts, links = discover(["fixtures/repo-d", "fixtures/repo-b"])
+                    dev = discover(["fixtures/repo-d", "fixtures/repo-b"])
+                    concepts = dev["concepts"]
+                    links = dev["links"]
                     mappings = align(concepts, links)
-                    self._send_json(mappings)
+                    self._send_json(
+                        {"demo": True, "origin": "fixture-demo", "data": mappings}
+                    )
                 except Exception as e:
                     self._send_json({"status": "error", "reason": str(e)}, status=500)
                 return
             if path == "/m3/workflow":
                 # M3 workflow view: ordered steps with evidence (C2)
+                if not _demo_opted_in(parsed):
+                    self._abstain(404)
+                    return
                 try:
                     from bo_ontology.alignment import build_workflow
                     from bo_extract.heuristic_concepts import discover
-                    concepts, _ = discover(["fixtures/repo-d", "fixtures/repo-b"])
-                    steps = build_workflow(concepts)
-                    self._send_json(steps)
+                    dev = discover(["fixtures/repo-d", "fixtures/repo-b"])
+                    steps = build_workflow(dev["concepts"])
+                    self._send_json(
+                        {"demo": True, "origin": "fixture-demo", "data": steps}
+                    )
                 except Exception as e:
                     self._send_json({"status": "error", "reason": str(e)}, status=500)
                 return

@@ -11,8 +11,9 @@ Extracts binding evidence from fixture sources as plain text:
   evidence (``static: true``).
 * OpenAPI paths and operations, plus client-URL to OpenAPI-path contract
   links: a link is ``compatible`` when the client URL path matches an
-  OpenAPI path, and ``equivalent`` is never true (a client URL carries
-  scheme+host; an OpenAPI path is path-only).
+  OpenAPI path *and* the client method matches the operation method, and
+  ``equivalent`` is never true (a client URL carries scheme+host; an
+  OpenAPI path is path-only).
 * Java method-body guards: each ``if`` whose failure branch throws or
   returns false becomes an ``enforced_rule`` (condition, failure outcome,
   enforcement line spans citing the guard-if body lines, not declarations),
@@ -47,6 +48,57 @@ _METHOD_LINE = re.compile(r"^\s{4}(get|post|put|delete|patch|options|head)\s*:\s
 _CREATE_TABLE = re.compile(r"(?i)^\s*CREATE\s+TABLE\s+([A-Za-z_][\w]*)\s*\(?\s*$")
 _COLUMN_LINE = re.compile(r"^\s*([A-Za-z_][\w]*)\s+([A-Za-z_][\w()<>, \t]*)\s*(.*)$")
 _CLIENT_URL = re.compile(r'https?://[^"\s\)]+')
+_CALL_METHOD_HINTS = (
+    ("postForObject", "post"),
+    ("postForEntity", "post"),
+    ("getForObject", "get"),
+    ("getForEntity", "get"),
+    ("patchForObject", "patch"),
+    ("headForHeaders", "head"),
+    ("optionsForAllow", "options"),
+)
+_URL_VAR = re.compile(r'\b([A-Za-z_][\w]*)\s*=\s*["\']https?://')
+_HTTP_METHOD = re.compile(r"HttpMethod\.([A-Za-z]+)")
+
+
+def _infer_client_method(url_record: dict[str, Any]) -> str | None:
+    """Trivial client-method inference from the URL record's source file.
+
+    Returns the HTTP method when the recorded URL (literal or its assigned
+    variable) visibly reaches a ``RestTemplate`` request call
+    (``postForObject``/``getForObject``/``exchange`` with an explicit
+    ``HttpMethod``, ...); otherwise None (abstain: unknown method).
+    """
+    try:
+        lines = Path(url_record["file"]).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    url = url_record.get("url", "")
+    var: str | None = None
+    lineno = url_record.get("line")
+    if isinstance(lineno, int) and 1 <= lineno <= len(lines):
+        match = _URL_VAR.search(lines[lineno - 1])
+        if match:
+            var = match.group(1)
+
+    def _reaches(text: str) -> bool:
+        if url and url in text:
+            return True
+        return bool(var) and re.search(r"\b" + re.escape(var) + r"\b", text) is not None
+
+    for text in lines:
+        if "exchange(" in text and _reaches(text):
+            method = _HTTP_METHOD.search(text)
+            return method.group(1).lower() if method else None
+        for hint, method in _CALL_METHOD_HINTS:
+            if hint + "(" in text and _reaches(text):
+                return method
+        put_delete = re.search(
+            r"\brestTemplate\s*\.\s*(put|delete)\s*\(", text, re.IGNORECASE
+        )
+        if put_delete is not None and _reaches(text):
+            return put_delete.group(1).lower()
+    return None
 
 
 def _content_hash(path: Path) -> str:
@@ -261,8 +313,9 @@ _SET_STATUS = re.compile(r"\.set[A-Z]\w*Status\(\s*\"([^\"]*)\"\s*\)")
 def _method_bodies(path: Path) -> list[dict[str, Any]]:
     """Method/constructor bodies as (lines, 1-based base line) slices.
 
-    Only braces on the declaration line and the following lines are counted,
-    so single-line bodies and abstract declarations are skipped.
+    Only braces on the declaration line (or an opening brace within the next
+    few lines, for brace-on-next-line style) are counted, so single-line
+    bodies and abstract declarations are skipped.
     """
     lines = path.read_text(encoding="utf-8").splitlines()
     bodies: list[dict[str, Any]] = []
@@ -273,19 +326,36 @@ def _method_bodies(path: Path) -> list[dict[str, Any]]:
             index += 1
             continue
         depth = lines[index].count("{") - lines[index].count("}")
+        brace_line = index
         if depth <= 0:
-            index += 1
-            continue
-        end = index
-        j = index + 1
+            found: int | None = None
+            for ahead in range(1, 4):
+                if index + ahead >= len(lines):
+                    break
+                if "{" in lines[index + ahead]:
+                    found = index + ahead
+                    break
+            if found is None:
+                index += 1
+                continue
+            brace_line = found
+            depth = sum(
+                lines[k].count("{") - lines[k].count("}")
+                for k in range(index, brace_line + 1)
+            )
+            if depth <= 0:
+                index += 1
+                continue
+        end = brace_line
+        j = brace_line + 1
         while j < len(lines) and depth > 0:
             depth += lines[j].count("{") - lines[j].count("}")
             end = j
             j += 1
         bodies.append({
             "name": match.group(1),
-            "lines": lines[index + 1:end],
-            "base": index + 2,
+            "lines": lines[brace_line + 1:end],
+            "base": brace_line + 2,
         })
         index = end + 1
     return bodies
@@ -299,16 +369,56 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
     age/vs-window comparison like ``days <= windowDays`` when present,
     otherwise the guard-if test), the failure outcome, and enforcement lines
     citing the guard-if body lines plus any compared-return line. Each status
-    change (``set*Status(...)``) guarded by a rule in the same method becomes
-    a transition record naming the guard and citing its enforcement lines.
+    change (``set*Status(...)``) guarded by a *preceding* enforced rule in
+    the same body becomes a transition record naming that nearest-prior
+    guard and citing its enforcement lines; an unguarded write (no prior
+    enforced guard, guard-after-write only) carries ``guard None`` with
+    empty enforcement -- no guard is synthesized.
     """
     enforced: list[dict[str, Any]] = []
     transitions: list[dict[str, Any]] = []
     bodies = _method_bodies(path)
-    file_methods = {body["name"] for body in bodies}
     for body in bodies:
         lines = body["lines"]
         base = body["base"]
+        # Brace depth at each body line (same counting as _method_bodies).
+        # Method entry is depth 1; depth is recorded before the line's
+        # own braces so an `if (...) {` sits at its block level.
+        # Parent-block identity: stack of enclosing blocks at each line
+        # start; each `{` pushes a unique opener id so sibling branches
+        # (if/else, sequential ifs) get distinct parents even when their
+        # depths match. A guard may only claim a write in the same parent.
+        depth_at: list[int] = []
+        stack_before: list[tuple] = []
+        _depth = 1
+        _stack: list[tuple | str] = ["method"]
+        for _idx, _line in enumerate(lines):
+            depth_at.append(_depth)
+            stack_before.append(tuple(_stack))
+            for _ch in _line:
+                if _ch == "{":
+                    _stack.append((_idx, len(_stack)))
+                elif _ch == "}":
+                    if len(_stack) > 1:
+                        _stack.pop()
+            _depth += _line.count("{") - _line.count("}")
+
+
+        def _parent_at(offset: int, match_start: int, line: str) -> tuple:
+            """Enclosing-block key for a statement starting at match_start.
+
+            Applies any braces in the line prefix (e.g. `} else if`)
+            to the line-start stack so an else-branch guard is keyed by
+            its real parent, not the sibling block it closes.
+            """
+            eff: list[tuple | str] = list(stack_before[offset])
+            for _ch in line[:match_start]:
+                if _ch == "{":
+                    eff.append((offset, len(eff)))
+                elif _ch == "}":
+                    if len(eff) > 1:
+                        eff.pop()
+            return tuple(eff)
         condition: str | None = None
         condition_line: int | None = None
         for offset, line in enumerate(lines):
@@ -318,33 +428,79 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                 if compare:
                     condition = f"{compare.group(1)} {compare.group(2)} {compare.group(3)}"
                     condition_line = base + offset
-        guard_lines: list[int] = []
+        body_guards: list[dict[str, Any]] = []
         for offset, line in enumerate(lines):
             guard = _IF_OPEN.search(line)
             if not guard:
                 continue
             condition_text = _if_condition(line)
+            if condition_text is None:
+                continue
             guard_line = base + offset
-            guard_lines.append(guard_line)
+            guard_parent = _parent_at(offset, guard.start(), line)
+            guard_depth = len(guard_parent)
+            guard_depth_scan = depth_at[offset] if offset < len(depth_at) else None
+            if guard_depth is None or guard_depth_scan is None:
+                continue
             indent = len(line) - len(line.lstrip())
             failure: str | None = None
-            for later in lines[offset + 1:]:
-                stripped = later.strip()
-                if stripped and len(later) - len(later.lstrip()) <= indent:
-                    break
-                if _THROW.search(later):
-                    failure = "rejection"
-                    break
-                if _FALSE_RETURN.search(later):
-                    failure = "false return"
-                    break
+            failure_line: int | None = None
+            scanned: list[int] = []
+            tail = line[guard.end():]
+            if _THROW.search(tail):
+                failure = "rejection"
+                failure_line = guard_line
+            elif _FALSE_RETURN.search(tail):
+                failure = "false return"
+                failure_line = guard_line
+            else:
+                for later_offset, later in enumerate(
+                    lines[offset + 1 :], start=offset + 1
+                ):
+                    stripped = later.strip()
+                    if stripped and len(later) - len(later.lstrip()) <= indent:
+                        break
+                    scanned.append(later_offset)
+                    later_depth = (
+                        depth_at[later_offset]
+                        if later_offset < len(depth_at)
+                        else None
+                    )
+                    # Direct-child failure only: a throw/return deeper than
+                    # one level belongs to a nested `if`, not this guard
+                    # (e.g. outer `if (flag)` must not claim an inner throw).
+                    # Skip it and keep scanning for a direct failure.
+                    if (
+                        guard_depth_scan is None
+                        or later_depth is None
+                        or later_depth > guard_depth_scan + 1
+                    ):
+                        continue
+                    if _THROW.search(later):
+                        failure = "rejection"
+                        failure_line = base + later_offset
+                        break
+                    if _FALSE_RETURN.search(later):
+                        failure = "false return"
+                        failure_line = base + later_offset
+                        break
             if failure is None:
                 continue
             enforcement = [guard_line]
+            if failure_line is not None and failure_line not in enforcement:
+                enforcement.append(failure_line)
             if condition_line is not None:
-                enforcement.append(condition_line)
+                cond_offset = condition_line - base
+                if cond_offset in scanned:
+                    enforcement.append(condition_line)
             call = _GUARD_CALL.search(condition_text)
-            guard_name = call.group(1) if call else (condition or "window guard")
+            if call:
+                guard_name = call.group(1)
+            else:
+                guard_name = (condition or condition_text.strip())
+                if not guard_name.strip():
+                    continue
+            enforcement = sorted(set(enforcement))
             record = dict(_base(path, guard_line))
             record.update({
                 "kind": "enforced_rule",
@@ -354,42 +510,40 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                 "guard": guard_name,
                 "guard_if_line": guard_line,
                 "enforcement_lines": enforcement,
-                "span": {"start_line": guard_line, "end_line": enforcement[-1]},
+                "span": {"start_line": enforcement[0], "end_line": enforcement[-1]},
             })
             enforced.append(record)
+            body_guards.append({
+                "guard": guard_name,
+                "guard_if_line": guard_line,
+                "enforcement_lines": enforcement,
+                "guard_depth": guard_depth,
+                "guard_parent": guard_parent,
+            })
         for offset, line in enumerate(lines):
             status = _SET_STATUS.search(line)
             if not status:
                 continue
             status_line = base + offset
-            guard_name: str | None = None
-            guard_line: int | None = None
-            for goffset, gline in enumerate(lines):
-                guard = _IF_OPEN.search(gline)
-                if not guard:
-                    continue
-                call = _GUARD_CALL.search(_if_condition(gline))
-                if call and call.group(1) in file_methods:
-                    guard_name = call.group(1)
-                    guard_line = base + goffset
-                    break
-            if guard_name is None:
-                for goffset in range(len(lines) - 1, -1, -1):
-                    guard = _IF_OPEN.search(lines[goffset])
-                    if guard:
-                        guard_line = base + goffset
-                        guard_name = (_if_condition(lines[goffset]) or "").strip() or "window guard"
-                        break
-            if guard_name is None:
-                guard_name = "window guard"
-                guard_line = status_line
+            write_parent = _parent_at(offset, status.start(), line)
+            write_depth = len(write_parent)
+            prior = [
+                g
+                for g in body_guards
+                if g["guard_if_line"] < status_line
+                and g.get("guard_depth") is not None
+                and write_depth is not None
+                and g["guard_depth"] == write_depth
+                and g.get("guard_parent") == write_parent
+            ]
+            best = max(prior, key=lambda g: g["guard_if_line"]) if prior else None
             transitions.append({
                 **_base(path, status_line),
                 "kind": "transition",
                 "target_status": status.group(1),
-                "guard": guard_name,
-                "guard_if_line": guard_line,
-                "enforcement_lines": [guard_line] if guard_line is not None else [],
+                "guard": best["guard"] if best is not None else None,
+                "guard_if_line": best["guard_if_line"] if best is not None else None,
+                "enforcement_lines": list(best["enforcement_lines"]) if best is not None else [],
                 "span": {"start_line": status_line, "end_line": status_line},
             })
     return enforced, transitions
@@ -398,11 +552,23 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
 def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Contract links between a client URL and OpenAPI paths.
 
-    Compatible when the client URL path matches an OpenAPI path; equivalent
-    is never true (client URL carries scheme+host, OpenAPI path is path-only).
+    Compatible only when the client URL path matches an OpenAPI path *and*
+    the client method matches the OpenAPI operation method (the client
+    method rides on the URL record, or is inferred trivially from
+    ``postForObject``/``getForObject``/``exchange`` call sites; unknown
+    method abstains via ``candidate-needs-method``). An unused URL whose
+    path matches nothing yields no links. Equivalent is never true (client
+    URL carries scheme+host, OpenAPI path is path-only).
     """
     links: list[dict[str, Any]] = []
     client_path = urlparse(url_record["url"]).path
+    explicit = url_record.get("method")
+    if explicit is not None and str(explicit).strip() != "":
+        client_method: str | None = str(explicit).strip().lower()
+    else:
+        client_method = _infer_client_method(url_record)
+    if not any(op.get("openapi_path") == client_path for op in openapi_records):
+        return []
     base = {
         **_base(Path(url_record["file"]), url_record["line"]),
         "kind": "contract_link",
@@ -420,14 +586,41 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
         link["openapi_path"] = op["openapi_path"]
         link["openapi_file"] = op["file"]
         link["openapi_line"] = op["line"]
-        link["compatible"] = op["openapi_path"] == client_path
+        op_method = op.get("method")
+        op_method_norm = (
+            str(op_method).strip().lower()
+            if op_method is not None and str(op_method).strip() != ""
+            else None
+        )
+        path_match = op["openapi_path"] == client_path
+        method_match = bool(
+            client_method and op_method_norm and client_method == op_method_norm
+        )
+        link["path_match"] = path_match
+        link["method_match"] = method_match
+        link["compatible"] = bool(path_match and method_match)
+        link["equivalent"] = False
+        never_equiv = "equivalent never true (client URL carries scheme+host, OpenAPI path is path-only)"
         if link["compatible"]:
             link["reason"] = (
-                f"compatible contract: client path {client_path} == openapi path {op['openapi_path']}"
+                f"compatible contract: client path {client_path} == openapi path {op['openapi_path']} "
+                f"and method {client_method} == {op_method_norm}; {never_equiv}"
             )
+        elif path_match:
+            if client_method is None or op_method_norm is None:
+                link["reason"] = (
+                    f"candidate-needs-method: path {client_path} matches but method is unknown "
+                    f"(client {client_method!r} vs openapi {op_method_norm!r}); {never_equiv}"
+                )
+            else:
+                link["reason"] = (
+                    f"incompatible contract: method mismatch client {client_method} != openapi "
+                    f"{op_method_norm} for path {client_path}; {never_equiv}"
+                )
         else:
             link["reason"] = (
-                f"incompatible contract: client path {client_path} != openapi path {op['openapi_path']}"
+                f"incompatible contract: client path {client_path} != openapi path {op['openapi_path']}; "
+                f"{never_equiv}"
             )
         links.append(link)
     return links

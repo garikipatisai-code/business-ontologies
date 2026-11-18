@@ -68,3 +68,20 @@ M3C implements alignment module + read-only views + server mount + verify_m3 gat
 - **gate**: `scripts/verify_java_slice.py` — full pytest + 3 Java suites + byte-identical check on `verify_m1/m2/m3.py` vs `c00c834` + honesty block; exits non-zero on any red. **GATE PASS (7/7)**.
 - **limitations**: JDK deviation (17 named, 26 used); stdlib YAML text-scan (no parser); single fixture pair; no observed runtime.
 - **compliance**: Python-only slice code plus pinned Maven jars; no new Python deps; no commit/push; no edits to M1/M2/M3 graders or frozen seals.
+
+## API Contract Labels (product decision, no body change)
+
+- **`/rules` + `/relations` are raw-list legacy bulk exports**: unfiltered
+  responses keep the exact bare-list body (repo-scoped via `?repo=` only)
+  for backward compatibility. The legacy/unfiltered nature is labeled
+  out-of-band only — response headers `X-Legacy-Bulk-Export: true` and
+  `X-Filter-Status: unfiltered-legacy` — never by reshaping the body.
+  Filtered requests (`?origin=`/`?status=`/`?kind=`/`?subject=`) return a
+  filtered list or a labeled `{"data","filter","legacy","unfiltered","reason"}`
+  envelope for unknown columns; no configured-store semantics in this batch.
+- **`/m3/*` is a default-off fixture demo**: `/m3/concepts`, `/m3/alignment`,
+  and `/m3/workflow` abstain (`404 {"status":"abstain"}`) unless explicitly
+  opted in via `?demo=1` (or `BO_M3_DEMO`/`BO_DEMO`/`BO_API_DEMO` env). Demo
+  responses carry the `{"demo":true,"origin":"fixture-demo"}` envelope and
+  are backed by `fixtures/repo-d` + `fixtures/repo-b` heuristic extraction
+  only. No configured-store M3 is implemented in this batch.

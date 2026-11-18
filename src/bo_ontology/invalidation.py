@@ -6,8 +6,10 @@ marked stale/superseded.
 
 Key constraints:
 * Invalidations are append-only (history preserved via audit log).
-* A changed artifact recomputes affected dependents; unrelated artifacts stay
-  unchanged.
+* A changed artifact is marked stale/superseded; recomputation of affected
+  dependents and preservation of unrelated artifacts are the store layer's
+  responsibility (``OntologyStore.invalidate`` leaves unrelated rows
+  untouched).
 * No silent carry-over: old values must not survive recomputation.
 * Superseded artifacts are marked stale+reason; reason links back to the
   invalidation decision via version.
@@ -15,9 +17,9 @@ Key constraints:
   superseded.
 
 Functions:
-* invalidate_artifact(): apply invalidation to a single artifact and recompute
-  affected dependents; returns the invalidated artifact with stale/superseded
-  status.
+* invalidate_artifact(): apply invalidation to a single artifact dict;
+  returns the invalidated artifact with stale/superseded status
+  (dependents/preservation belong to the store).
 
 The shim `src/bo_store/bo_ontology.py` re-exports these canonical modules.
 """
@@ -29,6 +31,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from .schema import Status, validate_status
+from .store import _ABSENT
 @dataclass
 class Invalidate:
     """Invalidation decision over an ontology artifact.
@@ -75,8 +78,8 @@ class Invalidate:
         False. The store layer owns relationship-aware preservation.
         """
         return False
-_ABSENT = object()
-"""Sentinel distinguishing 'new_value not supplied' from an explicit None (a storable value)."""
+"""Sentinel re-exported from ``bo_ontology.store`` so both modules share one
+'new_value not supplied' identity (explicit None stays storable)."""
 
 
 def invalidate_artifact(
@@ -84,13 +87,16 @@ def invalidate_artifact(
     reason: str | None = None,
     new_value: Any = _ABSENT,
 ) -> dict[str, Any]:
-    """Apply invalidation to an artifact and recompute affected dependents.
+    """Apply invalidation to a single artifact only.
 
-    * Marks the artifact as stale/superseded with the provided (or generated)
-      reason, linking version back to the invalidation.
-    * No silent carry: recomputes all affected artifacts, updating their status.
-    * Unrelated artifacts are preserved unchanged.
-    * Appends invalidation decision to audit log.
+    * Marks the supplied artifact dict as stale/superseded with the provided
+      (or generated) reason, linking version back to the invalidation.
+    * Touches only this dict: recomputation of affected dependents and
+      preservation of unrelated artifacts are the store layer's
+      responsibility (see ``OntologyStore.invalidate``), not done here.
+    * Pure (no DB/audit): returns a new dict without touching any store or
+      audit log; persistence/audit is the store layer's responsibility via
+      ``OntologyStore.invalidate``.
     * Returns the invalidated artifact with stale status.
 
     Amendment 2: optional ``new_value`` supplies the post-invalidation value.

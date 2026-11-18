@@ -75,6 +75,9 @@ _JSON_COLUMNS = frozenset({
     "location", "supporting", "conflicting", "limitations",
 })
 
+_ABSENT = object()
+"""Sentinel distinguishing 'new_value not supplied' from explicit None (storable)."""
+
 
 def confine_path(path: Any, workspace_root: Any = None) -> str:
     """Return a confined repository-relative path or raise ``ValueError``.
@@ -270,6 +273,73 @@ class OntologyStore:
         self._audit(table, record_id, "status", {"status": value})
         self.conn.commit()
         return self.get(table, record_id)
+
+    def invalidate(
+        self,
+        kind: str,
+        record_id: Any,
+        reason: str | None = None,
+        new_value: Any = _ABSENT,
+    ) -> dict:
+        """Mark a record stale/superseded through the audit-log store path.
+
+        The pure ``invalidate_artifact`` helper touches no DB; this method
+        owns persistence/audit: flips status to stale (via ``update_status``),
+        optionally stores ``new_value`` (explicit ``None`` is a storable
+        value, omission preserves the current value), appends one
+        ``invalidate`` audit entry preserving ``original_*`` (no silent
+        carry-over), and leaves unrelated rows untouched. Returns the
+        invalidated record with ``value``/``original_*`` aliases.
+        Raises ``ValueError`` if ``new_value`` is supplied for a kind with
+        no value column (concepts/operations/states/events/evidence):
+        there is nowhere to persist it, so claiming it in-memory would
+        be lost on the next read.
+        """
+        table = self._table_for(kind)
+        row = self.get(kind, record_id)
+        if row is None:
+            raise KeyError(f"unknown {table} record: {record_id!r}")
+        orig_status = row.get("status")
+        if "object" in _COLUMNS[table]:
+            value_key: str | None = "object"
+        elif "value" in _COLUMNS[table]:
+            value_key = "value"
+        else:
+            value_key = None
+        orig_value = row.get(value_key) if value_key else row.get("value", row.get("object"))
+        if new_value is not _ABSENT and value_key is None:
+            raise ValueError(
+                f"kind {kind!r} has no value column; new_value cannot be stored"
+            )
+        # Reuse the validated status path (audits a "status" entry).
+        self.update_status(kind, record_id, "stale")
+        if new_value is not _ABSENT:
+            self.conn.execute(
+                f"UPDATE {table} SET {value_key} = ? WHERE id = ?",
+                (_encode(new_value), record_id),
+            )
+        detail: dict[str, Any] = {
+            "reason": reason or "Artifact changed out-of-band (invalidated)",
+            "original_status": orig_status,
+            "original_value": orig_value,
+        }
+        if new_value is not _ABSENT:
+            detail["new_value"] = new_value
+        self._audit(table, record_id, "invalidate", detail)
+        self.conn.commit()
+        updated = self.get(kind, record_id)
+        assert updated is not None
+        result = dict(updated)
+        result["status"] = schema.Status.STALE.value
+        result["superseded"] = True
+        result["invalidation_reason"] = (
+            reason or "Artifact changed out-of-band (invalidated)"
+        )
+        result["original_status"] = orig_status
+        result["original_value"] = orig_value
+        if value_key == "object":
+            result["value"] = result.get("object")
+        return result
 
     def delete(self, kind: str, record_id: Any) -> bool:
         """Delete one record and append the deletion to the audit history."""
