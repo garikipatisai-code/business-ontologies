@@ -8,7 +8,10 @@ Extracts binding evidence from fixture sources as plain text:
   ``configured``; the stdlib-only limitation is recorded on every record
   (no YAML parser is used: indentation and value types are not validated).
 * SQL ``CREATE TABLE`` declarations and columns as static persistence
-  evidence (``static: true``).
+  evidence (``static: true``), plus ``FOREIGN KEY`` constraints -- inline
+  ``FOREIGN KEY (col) REFERENCES tbl(col) [ON DELETE/UPDATE action]``
+  and ``ALTER TABLE tbl ADD [CONSTRAINT name] FOREIGN KEY ...`` -- each
+  with table/column/reference/action evidence and line spans.
 * OpenAPI paths and operations, plus client-URL to OpenAPI-path contract
   links: a link is ``compatible`` when the client URL path matches an
   OpenAPI path *and* the client method matches the operation method, and
@@ -16,6 +19,19 @@ Extracts binding evidence from fixture sources as plain text:
   OpenAPI path is path-only). Each operation also carries its sibling
   ``operationId`` (when present) and its declared ``responses`` (status
   codes plus header names under ``responses:``, each with its line).
+* Bean Validation field constraints (``@NotNull``/``@NotEmpty``/
+  ``@NotBlank``/``@Size`` with params) on field/getter declarations with
+  annotation-to-declaration spans; superclass constraints merge with
+  ``inherited: true`` and the parent span cited when the superclass file
+  is in the scanned tree, otherwise an ``inheritance_gap`` (unresolved,
+  never fabricated); enforcement is a separate ``@Valid``/``@Validated``
+  param-or-validator-call check (declared-only otherwise, never an
+  HTTP 400 claim).
+* JPA-to-SQL links: an ``@Entity``/``@Table(name)`` entity links to its
+  ``CREATE TABLE`` only on a unique (exact-or-normalized) match, and a
+  ``@JoinColumn``/``@ManyToOne`` column verifies only when an FK on that
+  table covers the column and references a known table; anything else
+  abstains with a reason.
 * Java server interfaces (``interface X`` plus ``;``-terminated method
   signatures with return type/arity) and ``implements`` records (impl
   class, interface names, method name/arity/return, ``@Override``
@@ -64,8 +80,27 @@ _RESPONSES_LINE = re.compile(r"^\s*responses\s*:\s*$")
 _STATUS_LINE = re.compile(r"""^\s*['"]?(\d{3}|default)['"]?\s*:\s*(?:#.*)?$""")
 _HEADERS_LINE = re.compile(r"^\s*headers\s*:\s*$")
 _HEADER_NAME_LINE = re.compile(r"^\s*([A-Za-z_][\w\-]*)\s*:\s*(?:#.*)?$")
-_CREATE_TABLE = re.compile(r"(?i)^\s*CREATE\s+TABLE\s+([A-Za-z_][\w]*)\s*\(?\s*$")
-_COLUMN_LINE = re.compile(r"^\s*([A-Za-z_][\w]*)\s+([A-Za-z_][\w()<>, \t]*)\s*(.*)$")
+_CREATE_TABLE = re.compile(r"(?i)^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)\b.*$")
+_IF_NOT_EXISTS = re.compile(r"(?i)\bIF\s+NOT\s+EXISTS\b")
+_INLINE_FK = re.compile(
+    r"(?i)^\s*(?:CONSTRAINT\s+([A-Za-z_][\w]*)\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)"
+    r"\s*REFERENCES\s+([A-Za-z_][\w]*)\s*(?:\(([^)]+)\))?\s*(.*?)\s*,?\s*$"
+)
+_ALTER_FK = re.compile(
+    r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][\w]*)\s+ADD\s+"
+    r"(?:CONSTRAINT\s+([A-Za-z_][\w]*)\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)"
+    r"\s*REFERENCES\s+([A-Za-z_][\w]*)\s*(?:\(([^)]+)\))?\s*(.*?)\s*;?\s*$"
+)
+_FK_ON_DELETE = re.compile(
+    r"(?i)\bON\s+DELETE\s+(CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION)"
+)
+_FK_ON_UPDATE = re.compile(
+    r"(?i)\bON\s+UPDATE\s+(CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION)"
+)
+_SKIP_COLUMN_DEF = re.compile(
+    r"(?i)^\s*(PRIMARY|FOREIGN|UNIQUE|CONSTRAINT|CHECK|KEY|EXCLUDE)\b"
+)
+_COLUMN_LINE = re.compile(r"^\s*([A-Za-z_][\w]*)\s+([A-Za-z_][\w]*(?:\s*\([^)]*\))?(?:\s*\[\s*\])*)\s*(.*)$")
 _CLIENT_URL = re.compile(r'https?://[^"\s\)]+')
 _REST_TEMPLATE_DECL = re.compile(r"\bRestTemplate\s+([A-Za-z_][\w]*)")
 _CALL_METHOD_HINTS = (
@@ -277,45 +312,782 @@ def extract_yaml_policy(path: Path) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------- SQL persistence
 
 
+def _fk_action(match: re.Match | None) -> str | None:
+    """Normalized FK referential action (upper, single spaces) or None."""
+    if match is None:
+        return None
+    return " ".join(match.group(1).upper().split())
+
+
 def extract_sql_persistence(path: Path) -> list[dict[str, Any]]:
-    """CREATE TABLE declarations and columns as static persistence evidence."""
+    """CREATE TABLE declarations/columns plus FOREIGN KEY constraints.
+
+    Tables record ``if_not_exists``; single-line and multi-line
+    ``CREATE TABLE`` headers both match (the header regex allows trailing
+    ``(...)`` on the same line). Inline ``FOREIGN KEY (cols)
+    REFERENCES tbl(cols) [ON DELETE/UPDATE action]`` lines (including an
+    inline ``CONSTRAINT name``) and ``ALTER TABLE tbl ADD [CONSTRAINT name]
+    FOREIGN KEY ...`` statements each become an ``fk_constraint`` record
+    (table, columns, ref table/columns, actions or None, line span).
+    Constraint-definition lines (PRIMARY / FOREIGN / UNIQUE / ...) are
+    never collected as columns. ``ALTER TABLE`` statements may span
+    continuation lines (joined until ``;`` or up to four following lines);
+    single-line statements remain the canonical form. A closing-line FK
+    (the line that balances the outer ``CREATE TABLE`` parens, e.g. ending
+    in ``);``) is still processed before the depth break.
+    """
     records: list[dict[str, Any]] = []
     lines = path.read_text(encoding="utf-8").splitlines()
     index = 0
     while index < len(lines):
         match = _CREATE_TABLE.match(lines[index])
-        if not match:
+        if match:
+            table = match.group(1)
+            start = index
+            if_not_exists = bool(_IF_NOT_EXISTS.search(lines[start]))
             index += 1
+            depth = lines[start].count("(") - lines[start].count(")")
+            columns: list[dict[str, str]] = []
+            while index < len(lines) and depth > 0:
+                column_line = lines[index]
+                depth += column_line.count("(") - column_line.count(")")
+                # MED3: check FK before thedepth<=0 break so a closing-line
+                # FK (e.g. ending in ");") is still recorded.
+                fk_match = _INLINE_FK.match(column_line)
+                if fk_match:
+                    rest = fk_match.group(5) or ""
+                    record = dict(_base(path, index + 1))
+                    record.update({
+                        "kind": "fk_constraint",
+                        "table": table,
+                        "columns": [
+                            c.strip()
+                            for c in fk_match.group(2).split(",")
+                            if c.strip()
+                        ],
+                        "ref_table": fk_match.group(3),
+                        "ref_columns": [
+                            c.strip()
+                            for c in (fk_match.group(4) or "").split(",")
+                            if c.strip()
+                        ],
+                        # NOTE (deferred, maintainability out of scope):
+                        # on_delete/on_update extraction duplicates the
+                        # ALTER-FK path below (367-368/412-413 in review);
+                        # intentional, do not refactor.
+                        "on_delete": _fk_action(_FK_ON_DELETE.search(rest)),
+                        "on_update": _fk_action(_FK_ON_UPDATE.search(rest)),
+                        "name": fk_match.group(1),
+                        "span": {"start_line": index + 1, "end_line": index + 1},
+                    })
+                    records.append(record)
+                elif depth <= 0:
+                    break
+                elif not _SKIP_COLUMN_DEF.match(column_line):
+                    col_match = _COLUMN_LINE.match(column_line)
+                    if col_match:
+                        columns.append({
+                            "name": col_match.group(1),
+                            "data_type": col_match.group(2).strip(),
+                            "constraints": col_match.group(3).strip(),
+                        })
+                index += 1
+            record = dict(_base(path, start + 1))
+            record.update({
+                "kind": "create_table",
+                "table": table,
+                "columns": columns,
+                "if_not_exists": if_not_exists,
+                "static": True,
+                "evidence": "persistence",
+                "span": {"start_line": start + 1, "end_line": index + 1},
+            })
+            records.append(record)
             continue
-        table = match.group(1)
-        start = index
+        alter_match = _ALTER_FK.match(lines[index])
+        alter_end = index
+        if alter_match is None and re.match(
+            r"(?i)^\s*ALTER\s+TABLE\b", lines[index]
+        ):
+            # Multi-line ALTER: join continuation lines (single-line is
+            # canonical; joining is best-effort up to 4 following lines).
+            joined = lines[index]
+            for ahead in range(1, 5):
+                if index + ahead >= len(lines):
+                    break
+                joined += " " + lines[index + ahead].strip()
+                alter_end = index + ahead
+                if ";" in lines[index + ahead] or _ALTER_FK.match(joined):
+                    break
+            alter_match = _ALTER_FK.match(joined)
+            if alter_match is None:
+                alter_end = index
+        if alter_match:
+            rest = alter_match.group(6) or ""
+            record = dict(_base(path, index + 1))
+            record.update({
+                "kind": "fk_constraint",
+                "table": alter_match.group(1),
+                "columns": [
+                    c.strip()
+                    for c in alter_match.group(3).split(",")
+                    if c.strip()
+                ],
+                "ref_table": alter_match.group(4),
+                "ref_columns": [
+                    c.strip()
+                    for c in (alter_match.group(5) or "").split(",")
+                    if c.strip()
+                ],
+                # NOTE (deferred, maintainability out of scope): duplicates
+                # the inline-FK action extraction above; intentional.
+                "on_delete": _fk_action(_FK_ON_DELETE.search(rest)),
+                "on_update": _fk_action(_FK_ON_UPDATE.search(rest)),
+                "name": alter_match.group(2),
+                "span": {"start_line": index + 1, "end_line": alter_end + 1},
+            })
+            records.append(record)
+            index = alter_end + 1
+            continue
         index += 1
-        depth = lines[start].count("(") - lines[start].count(")")
-        columns: list[dict[str, str]] = []
-        while index < len(lines) and depth > 0:
-            column_line = lines[index]
-            depth += column_line.count("(") - column_line.count(")")
-            if depth <= 0:
+    return records
+
+
+# ---------------------------------------------------------------- validation constraints and JPA entities
+
+
+_CONSTRAINT_ANNOTATIONS = {"NotNull", "NotEmpty", "NotBlank", "Size"}
+_CLASS_DECL = re.compile(
+    r"^\s*(?:(?:public|protected|private|abstract|final|sealed)\s+)*"
+    r"class\s+([A-Za-z_][\w]*)"
+    r"(?:\s+extends\s+([A-Za-z_][\w]*))?"
+)
+_FIELD_DECL = re.compile(
+    r"^\s*(?!(?:return|throw|new|else)\b)(?:(?:private|protected|public)\s+)?"
+    r"(?:(?:static|final|transient|volatile)\s+)*"
+    r"[\w<>\[\]\?,\s\.@]+\s+([A-Za-z_][\w]*)\s*(?:=[^;]*)?;\s*$"
+)
+_GETTER_DECL = re.compile(
+    r"^\s*(?:public|protected|private)\s+[\w<>\[\]\?,\s\.@]+\s+"
+    r"(?:get|is)([A-Za-z_][\w]*)\s*\(\s*\)"
+)
+_TABLE_NAME = re.compile(r"@Table\s*\([^)]*name\s*=\s*\"([^\"]+)\"")
+_JOINCOLUMN_NAME = re.compile(
+    r"@JoinColumn\s*\([^)]*name\s*=\s*\"([^\"]+)\""
+)
+_MANY_TO_ONE = re.compile(r"^\s*@ManyToOne\b")
+_ENTITY_MARKER = re.compile(r"^\s*@Entity\b")
+_VALID_PARAM = re.compile(r"@Valid(?:ated)?\b")
+_VALIDATOR_CALL = re.compile(r"\bvalidator\s*\.\s*validate\s*\(")
+_VALIDATOR_FACTORY = re.compile(
+    r"\bValidation\s*\.\s*buildDefaultValidatorFactory\s*\("
+)
+
+
+def _preceding_annotations(
+    lines: list[str], decl_line: int
+) -> list[tuple[int, str, str]]:
+    """Consecutive annotation lines directly above 1-based ``decl_line``.
+
+    Returns ``[(line, name, args)]`` bottom-up source order (topmost
+    first); stops at the first blank/non-annotation line (a blank line or
+    comment between the annotation and the declaration breaks the block
+    by design: abstain, documented, not fixed).
+    """
+    entries: list[tuple[int, str, str]] = []
+    idx = decl_line - 1
+    while idx >= 1:
+        match = _ANNOTATION_LINE.match(lines[idx - 1])
+        if not match:
+            break
+        entries.append((idx, match.group(1), match.group(2).strip()))
+        idx -= 1
+    entries.reverse()
+    return entries
+
+
+def _unquote(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text
+
+
+def _annotation_params(args_text: str) -> dict[str, str]:
+    """Bare ``(k=v, ...)`` annotation args; quote-aware, strings unquoted."""
+    params: dict[str, str] = {}
+    text = (args_text or "").strip()
+    if not text.startswith("("):
+        return params
+    inner = text[1:]
+    if inner.endswith(")"):
+        inner = inner[:-1]
+    parts: list[str] = []
+    buf = ""
+    in_str: str | None = None
+    for ch in inner:
+        if in_str is not None:
+            buf += ch
+            if ch == in_str:
+                in_str = None
+        elif ch in ("'", '"'):
+            in_str = ch
+            buf += ch
+        elif ch == ",":
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            key, _, value = part.partition("=")
+            params[key.strip()] = _unquote(value)
+        else:
+            params["value"] = _unquote(part)
+    return params
+
+
+def _class_decls(path: Path) -> list[dict[str, Any]]:
+    """``class C [extends P]`` declarations with 1-based lines."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    decls: list[dict[str, Any]] = []
+    for index, line in enumerate(lines, start=1):
+        match = _CLASS_DECL.match(line)
+        if match:
+            decls.append({
+                "class": match.group(1),
+                "superclass": match.group(2),
+                "line": index,
+            })
+    return decls
+
+
+def _is_field_line(line: str) -> bool:
+    """Reject method-like matches (``(`` before any ``=``)."""
+    if "(" not in line:
+        return True
+    eq = line.find("=")
+    return eq != -1 and eq < line.find("(")
+
+
+def extract_field_constraints(path: Path) -> list[dict[str, Any]]:
+    """Bean Validation constraints on field/getter declarations.
+
+    Each ``@NotNull``/``@NotEmpty``/``@NotBlank``/``@Size`` annotation in
+    the consecutive block directly above a field (or getter, recorded
+    under its derived property name) becomes a ``field_constraint``
+    record with params, annotation-to-declaration span, and
+    ``inherited: False`` (inheritance is resolved separately).
+    Unannotated declarations yield nothing (abstain). Package-private
+    fields (no visibility modifier) are supported.
+
+    NOTE (deferred, maintainability out of scope): the field/getter scan
+    duplicates the join-column scan in ``extract_jpa_entities``; kept
+    separate intentionally, do not refactor.
+    """
+    records: list[dict[str, Any]] = []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    classes: list[tuple[int, str]] = []
+    for index, line in enumerate(lines, start=1):
+        match = _CLASS_DECL.match(line)
+        if match:
+            classes.append((index, match.group(1)))
+
+    def _owner(index: int) -> str | None:
+        current: str | None = None
+        for decl_line, name in classes:
+            if decl_line < index:
+                current = name
+            else:
                 break
-            col_match = _COLUMN_LINE.match(column_line)
-            if col_match:
-                columns.append({
-                    "name": col_match.group(1),
-                    "data_type": col_match.group(2).strip(),
-                    "constraints": col_match.group(3).strip(),
-                })
-            index += 1
-        record = dict(_base(path, start + 1))
+        return current
+
+    for index, line in enumerate(lines, start=1):
+        field_match = _FIELD_DECL.match(line)
+        field: str | None = None
+        if field_match and _is_field_line(line):
+            field = field_match.group(1)
+        else:
+            getter_match = _GETTER_DECL.match(line)
+            if getter_match:
+                suffix = getter_match.group(1)
+                field = suffix[0].lower() + suffix[1:] if suffix else None
+        if not field:
+            continue
+        found = [
+            (line_no, name, args)
+            for line_no, name, args in _preceding_annotations(lines, index)
+            if name.split(".")[-1] in _CONSTRAINT_ANNOTATIONS
+        ]
+        if not found:
+            continue
+        for line_no, name, args in found:
+            record = dict(_base(path, index))
+            record.update({
+                "kind": "field_constraint",
+                "class": _owner(index),
+                "field": field,
+                "annotation": name.split(".")[-1],
+                "params": _annotation_params(args),
+                "inherited": False,
+                "span": {"start_line": line_no, "end_line": index},
+            })
+            records.append(record)
+    return records
+
+
+def resolve_inheritance(paths: list[Path | str]) -> list[dict[str, Any]]:
+    """Merge superclass constraints / report gaps over a scanned tree.
+
+    When a ``class C extends P`` superclass file is present in ``paths``,
+    P's constraints (own plus transitive) merge as copies with
+    ``class`` C, ``inherited: True``, ``parent_class`` P, and the parent
+    span cited (evidence stays at the parent file/line). When P is absent,
+    one ``inheritance_gap`` record (``resolved: False``) is emitted and no
+    inherited rules are fabricated.
+    """
+    files = [Path(p) for p in paths]
+    own: dict[str, list[dict[str, Any]]] = {}
+    decl_file: dict[str, Path] = {}
+    parents: dict[str, str | None] = {}
+    decl_lines: dict[str, tuple[Path, int]] = {}
+    order: list[str] = []
+    for file in files:
+        try:
+            decls = _class_decls(file)
+        except (OSError, UnicodeError):
+            continue
+        for decl in decls:
+            parents.setdefault(decl["class"], decl["superclass"])
+            decl_lines.setdefault(decl["class"], (file, decl["line"]))
+            if decl["class"] not in decl_file:
+                decl_file[decl["class"]] = file
+                order.append(decl["class"])
+        try:
+            constraints = extract_field_constraints(file)
+        except (OSError, UnicodeError):
+            constraints = []
+        for record in constraints:
+            own.setdefault(str(record.get("class")), []).append(record)
+    memo: dict[str, list[dict[str, Any]]] = {}
+
+    def _inherited(cls: str, seen: frozenset) -> list[dict[str, Any]]:
+        if cls in memo:
+            return memo[cls]
+        if cls in seen:
+            memo[cls] = []
+            return []
+        parent = parents.get(cls)
+        if not parent or parent not in decl_file:
+            memo[cls] = []
+            return []
+        merged: list[dict[str, Any]] = []
+        for record in own.get(parent, []):
+            copy = dict(record)
+            copy["class"] = cls
+            copy["inherited"] = True
+            copy["parent_class"] = parent
+            merged.append(copy)
+        for record in _inherited(parent, seen | {cls}):
+            copy = dict(record)
+            copy["class"] = cls
+            # MED1: transitive copies re-point parent_class to the immediate
+            # parent; file/span stay at the original evidence (never rewritten).
+            copy["parent_class"] = parent
+            merged.append(copy)
+        memo[cls] = merged
+        return merged
+
+    resolved: list[dict[str, Any]] = []
+    for cls in order:
+        parent = parents.get(cls)
+        if not parent:
+            continue
+        if parent in decl_file:
+            resolved.extend(_inherited(cls, frozenset()))
+        else:
+            file, line = decl_lines[cls]
+            gap = dict(_base(file, line))
+            gap.update({
+                "kind": "inheritance_gap",
+                "class": cls,
+                "superclass": parent,
+                "resolved": False,
+                "reason": (
+                    f"unresolved: superclass {parent!r} of {cls!r} not "
+                    "present in scanned tree (abstain, no inherited "
+                    "rules claimed)"
+                ),
+                "span": {"start_line": line, "end_line": line},
+            })
+            resolved.append(gap)
+    return resolved
+
+
+def _signature_param_text(signature: str) -> str | None:
+    """Parameter-list text inside the outer parens of a signature.
+
+    Balanced-paren scan (quote-aware) so ``@Valid`` in the return position
+    is never mistaken for a bound param. Returns None when the parens do
+    not balance (abstain, never half-parse).
+    """
+    start = signature.find("(")
+    if start == -1:
+        return None
+    depth = 0
+    in_str: str | None = None
+    for idx in range(start, len(signature)):
+        ch = signature[idx]
+        if in_str is not None:
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return signature[start + 1:idx]
+    return None
+
+
+def has_valid_enforcement(path: Path) -> dict[str, Any]:
+    """File-level enforcement verdict for declared constraints.
+
+    ``verified`` True only with same-method evidence: a ``@Valid``/
+    ``@Validated`` bound param inside the parameter list (``@Valid`` in
+    the return position alone never verifies), or an explicit validator
+    call (``validator.validate(...)`` /
+    ``Validation.buildDefaultValidatorFactory()``) in the body. Otherwise
+    ``verified`` False (declared only; never an HTTP 400 claim).
+
+    NOTE (deferred, documented not fixed): the validator receiver name is
+    fixed (``validator``); custom-named ``Validator`` variables abstain.
+    A ``Validation.buildDefaultValidatorFactory()`` call counts as
+    validator-call evidence (factory alone, without ``validate(...)``,
+    is recorded the same way).
+    """
+    file = Path(path)
+    try:
+        lines = file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        record = dict(_base(file, 1)) if file.exists() else {
+            "origin": ORIGIN,
+            "extractor_version": EXTRACTOR_VERSION,
+            "file": str(file),
+            "line": 1,
+            "content_hash": "",
+        }
         record.update({
-            "kind": "create_table",
+            "kind": "enforcement",
+            "verified": False,
+            "methods": [],
+            "evidence_spans": [],
+            "reason": "declared-only: file unreadable (no enforcement evidence)",
+        })
+        return record
+    try:
+        bodies = _method_bodies(file)
+    except (OSError, UnicodeError):
+        bodies = []
+    methods: list[dict[str, Any]] = []
+    for body in bodies:
+        signature = "\n".join(lines[body["decl"] - 1:body["base"] - 1])
+        kinds: list[tuple[str, int]] = []
+        # MED2: require @Valid/@Validated inside the param list (paren
+        # text), not the return position.
+        param_text = _signature_param_text(signature)
+        if param_text is not None and _VALID_PARAM.search(param_text):
+            kinds.append(("valid_param", body["decl"]))
+        for offset, text in enumerate(body["lines"]):
+            if _VALIDATOR_CALL.search(text) or _VALIDATOR_FACTORY.search(text):
+                kinds.append(("validator_call", body["base"] + offset))
+                break
+        if kinds:
+            start = min([body["decl"]] + [line for _, line in kinds])
+            end = max([line for _, line in kinds])
+            methods.append({
+                "method": body["name"],
+                "decl_line": body["decl"],
+                "evidence": [kind for kind, _ in kinds],
+                "span": {"start_line": start, "end_line": end},
+            })
+    verified = bool(methods)
+    spans = [m["span"] for m in methods]
+    record = dict(_base(file, spans[0]["start_line"] if spans else 1))
+    if verified:
+        detail = "; ".join(
+            f"{m['method']} via {','.join(m['evidence'])} "
+            f"(L{m['span']['start_line']}-L{m['span']['end_line']})"
+            for m in methods
+        )
+        reason = f"enforced: {detail}; same-method evidence only"
+    else:
+        reason = (
+            "declared-only: no @Valid/@Validated param or validator call "
+            "in file (no enforcement evidence)"
+        )
+    record.update({
+        "kind": "enforcement",
+        "verified": verified,
+        "methods": methods,
+        "evidence_spans": spans,
+        "reason": reason,
+    })
+    return record
+
+
+def extract_jpa_entities(path: Path) -> list[dict[str, Any]]:
+    """``@Entity`` classes: table name plus join-column declarations.
+
+    Only classes with an ``@Entity`` marker in the annotation block
+    directly above the class declaration are recorded; the table comes
+    from ``@Table(name=...)`` (None when absent: abstain, never guessed).
+    Each field/getter whose annotation block holds ``@JoinColumn`` yields
+    a join-column entry (column from ``name=...``, None when absent) with
+    its ``@ManyToOne`` presence and span.
+
+    NOTE (deferred, maintainability out of scope): the field/getter scan
+    duplicates ``extract_field_constraints``; kept separate intentionally.
+    """
+    records: list[dict[str, Any]] = []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines, start=1):
+        decl = _CLASS_DECL.match(line)
+        if not decl:
+            continue
+        block = _preceding_annotations(lines, index)
+        if not any(_ENTITY_MARKER.match(lines[n - 1]) for n, _, _ in block):
+            continue
+        table: str | None = None
+        for n, _, _ in block:
+            table_match = _TABLE_NAME.search(lines[n - 1])
+            if table_match:
+                table = table_match.group(1)
+        joins: list[dict[str, Any]] = []
+        for findex, fline in enumerate(lines, start=1):
+            if findex <= index:
+                continue
+            field_match = _FIELD_DECL.match(fline)
+            field: str | None = None
+            if field_match and _is_field_line(fline):
+                field = field_match.group(1)
+            else:
+                getter_match = _GETTER_DECL.match(fline)
+                if getter_match:
+                    suffix = getter_match.group(1)
+                    field = suffix[0].lower() + suffix[1:] if suffix else None
+            if not field:
+                continue
+            fblock = _preceding_annotations(lines, findex)
+            column: str | None = None
+            found_join = False
+            for n, name, args in fblock:
+                if name.split(".")[-1] == "JoinColumn":
+                    found_join = True
+                    params = _annotation_params(args)
+                    column = params.get("name")
+            if not found_join:
+                continue
+            many = any(
+                _MANY_TO_ONE.match(lines[n - 1]) for n, _, _ in fblock
+            )
+            start = fblock[0][0] if fblock else findex
+            joins.append({
+                "field": field,
+                "column": column,
+                "many_to_one": many,
+                "line": findex,
+                "span": {"start_line": start, "end_line": findex},
+            })
+        start = block[0][0] if block else index
+        record = dict(_base(path, index))
+        record.update({
+            "kind": "jpa_entity",
+            "class": decl.group(1),
+            "superclass": decl.group(2),
             "table": table,
-            "columns": columns,
-            "static": True,
-            "evidence": "persistence",
-            "span": {"start_line": start + 1, "end_line": index + 1},
+            "join_columns": joins,
+            "span": {"start_line": start, "end_line": index},
         })
         records.append(record)
     return records
+
+
+def _normalize_table(name: str | None) -> str:
+    """Normalized table identity: strip quotes/backticks, lower, drop _/-.
+
+    Quoted identifiers (``"widgets"``, ```widgets```) are already covered
+    by this normalization. Only table identity is normalized; column
+    matching stays case-insensitive exact (documented, not normalized).
+    """
+    text = str(name or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"', "`"):
+        text = text[1:-1]
+    text = text.strip().strip("\"'`")
+    return re.sub(r"[_\\-]", "", text.lower())
+
+
+def link_jpa_to_sql(
+    entity_records: list[dict[str, Any]],
+    sql_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Link JPA entities/join columns to CREATE TABLE/FK evidence.
+
+    One record per (entity, join column) -- plus one table-only record for
+    entities declaring no join columns. ``verified`` True requires all
+    three: the entity table matches exactly one ``CREATE TABLE`` (exact or
+    normalized -- normalization strips quotes/backticks, lowercases, and
+    removes ``_``/``-``; zero or 2+ abstain as unresolved), an FK on that
+    table covers the join column, and the FK references a known table.
+    Anything else abstains (``verified`` False) with a reason; ambiguity
+    or absence never verifies. A bare ``col REFERENCES tbl`` without the
+    ``FOREIGN KEY`` keyword is not an FK (abstain, documented, not fixed).
+    """
+    tables = [r for r in sql_records if r.get("kind") == "create_table"]
+    fks = [r for r in sql_records if r.get("kind") == "fk_constraint"]
+    known = {_normalize_table(str(t.get("table", ""))) for t in tables}
+    links: list[dict[str, Any]] = []
+
+    def _link(
+        entity: dict[str, Any],
+        table: dict[str, Any] | None,
+        fk: dict[str, Any] | None,
+        column: str | None,
+        verified: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        record = dict(_base(Path(str(entity["file"])), int(entity["line"])))
+        record.update({
+            "kind": "jpa_sql_link",
+            "entity": entity.get("class"),
+            "table": entity.get("table"),
+            "column": column,
+            "fk": fk,
+            "verified": verified,
+            "reason": reason,
+            "spans": {
+                "entity": entity.get("span"),
+                "table": table.get("span") if table else None,
+                "fk": fk.get("span") if fk else None,
+            },
+        })
+        return record
+
+    for entity in entity_records:
+        if entity.get("kind") != "jpa_entity":
+            continue
+        want = entity.get("table")
+        matches: list[dict[str, Any]] = []
+        if want:
+            want_norm = _normalize_table(str(want))
+            matches = [
+                t for t in tables
+                if _normalize_table(str(t.get("table", ""))) == want_norm
+            ]
+        columns = entity.get("join_columns") or []
+        if not columns:
+            if not want:
+                links.append(_link(
+                    entity, None, None, None, False,
+                    "unresolved: no @Table name and no join columns "
+                    "(abstain, nothing to link)",
+                ))
+            elif len(matches) != 1:
+                links.append(_link(
+                    entity, None, None, None, False,
+                    f"unresolved: table {want!r} matches "
+                    f"{len(matches)} CREATE TABLE declarations "
+                    "(abstain, table-only, no join columns to verify)",
+                ))
+            else:
+                links.append(_link(
+                    entity, matches[0], None, None, False,
+                    f"table-only: entity {entity.get('class')!r} matches "
+                    f"table {want!r} but declares no join columns "
+                    "(no FK link claimed)",
+                ))
+            continue
+        for join in columns:
+            column = join.get("column")
+            if not want:
+                links.append(_link(
+                    entity, None, None, column, False,
+                    f"unresolved: entity {entity.get('class')!r} has no "
+                    "@Table name (abstain, table unknown)",
+                ))
+            elif len(matches) == 0:
+                links.append(_link(
+                    entity, None, None, column, False,
+                    f"unresolved: table {want!r} matches no CREATE TABLE "
+                    "(abstain, table unknown)",
+                ))
+            elif len(matches) > 1:
+                links.append(_link(
+                    entity, None, None, column, False,
+                    f"unresolved: table {want!r} matches {len(matches)} "
+                    "CREATE TABLE declarations "
+                    "(ambiguous, abstain, never verified)",
+                ))
+            elif not column:
+                links.append(_link(
+                    entity, matches[0], None, None, False,
+                    f"partial: table {want!r} matches but join field "
+                    f"{join.get('field')!r} declares no column name "
+                    "(abstain, column unknown)",
+                ))
+            else:
+                table = matches[0]
+                wanted = str(column).lower()
+                covered = [
+                    fk for fk in fks
+                    if str(fk.get("table", "")).lower()
+                    == str(table.get("table", "")).lower()
+                    and wanted in [
+                        str(c).lower() for c in fk.get("columns", [])
+                    ]
+                ]
+                if not covered:
+                    links.append(_link(
+                        entity, table, None, column, False,
+                        f"partial: table {want!r} matches but no FK on "
+                        f"that table covers column {column!r} "
+                        "(abstain, FK unknown)",
+                    ))
+                elif len(covered) > 1:
+                    links.append(_link(
+                        entity, table, None, column, False,
+                        f"unresolved: {len(covered)} FKs on table "
+                        f"{want!r} cover column {column!r} "
+                        "(ambiguous, abstain, never verified)",
+                    ))
+                else:
+                    fk = covered[0]
+                    ref = str(fk.get("ref_table") or "")
+                    if ref and _normalize_table(ref) in known:
+                        links.append(_link(
+                            entity, table, fk, column, True,
+                            f"verified: entity {entity.get('class')!r} -> "
+                            f"table {want!r} "
+                            f"(L{table.get('line')}) + column {column!r} "
+                            f"in FK (L{fk.get('line')}) -> {ref!r}; "
+                            "entity+column+FK all match",
+                        ))
+                    else:
+                        links.append(_link(
+                            entity, table, fk, column, False,
+                            f"partial: entity {entity.get('class')!r} -> "
+                            f"table {want!r} + column {column!r} in FK "
+                            f"(L{fk.get('line')}) but ref table {ref!r} "
+                            "is not a known table (abstain)",
+                        ))
+    return links
 
 
 # ---------------------------------------------------------------- OpenAPI
@@ -1096,6 +1868,9 @@ def extract_client_urls(path: Path) -> list[dict[str, Any]]:
 
 # ---------------------------------------------------------------- Java guards and transitions
 
+# Single-line declarations only; wrapped (multi-line) signatures abstain
+# (no half-parse): the `[^)]*` param group requires the full declaration
+# on one line, so a signature split across lines yields no match by design.
 _METHOD_WITH_BODY = re.compile(
     r"^\s*(?:public|private|protected|static\s+)*(?:[\w<>\[\]\s,\?\.]*)\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*(?:throws\s+[\w\.\[\]\s,]+)?\s*\{?\s*$"
 )
@@ -1223,7 +1998,9 @@ def _method_bodies(path: Path) -> list[dict[str, Any]]:
 
     Only braces on the declaration line (or an opening brace within the next
     few lines, for brace-on-next-line style) are counted, so single-line
-    bodies and abstract declarations are skipped.
+    bodies and abstract declarations are skipped. Wrapped (multi-line)
+    declarations abstain by design (single-line only, no half-parse):
+    ``_METHOD_WITH_BODY`` requires the full signature on one line.
     """
     lines = path.read_text(encoding="utf-8").splitlines()
     bodies: list[dict[str, Any]] = []
