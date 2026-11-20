@@ -13,7 +13,21 @@ Extracts binding evidence from fixture sources as plain text:
   links: a link is ``compatible`` when the client URL path matches an
   OpenAPI path *and* the client method matches the operation method, and
   ``equivalent`` is never true (a client URL carries scheme+host; an
-  OpenAPI path is path-only).
+  OpenAPI path is path-only). Each operation also carries its sibling
+  ``operationId`` (when present) and its declared ``responses`` (status
+  codes plus header names under ``responses:``, each with its line).
+* Java server interfaces (``interface X`` plus ``;``-terminated method
+  signatures with return type/arity) and ``implements`` records (impl
+  class, interface names, method name/arity/return, ``@Override``
+  presence, body span), plus operation-to-implementation bindings: a
+  ``full`` bind needs the operationId to name an interface method AND a
+  same-name/same-arity method on an implementing class AND at least one
+  corroboration (path literal or return-type match); a missing
+  interface file yields ``partial`` (never full), name-only matches
+  abstain, multiple implementors abstain as ambiguous, and an impl
+  status outside the declared responses yields ``partial`` with
+  ``response_supported`` False. Client invocation, destination, and
+  delivery are never proved by a binding.
 * Java method-body guards: each ``if`` whose failure branch throws or
   returns false becomes an ``enforced_rule`` (condition, failure outcome,
   enforcement line spans citing the guard-if body lines, not declarations),
@@ -45,6 +59,11 @@ _ANNOTATION_LINE = re.compile(r"^\s*@([A-Za-z_][\w\.]*)\s*(.*)$")
 _POSTMAPPING_VALUE = re.compile(r'@PostMapping\(\s*"([^"]*)"\s*\)')
 _PATH_LINE = re.compile(r"^\s{2}(/.+?):\s*$")
 _METHOD_LINE = re.compile(r"^\s{4}(get|post|put|delete|patch|options|head)\s*:\s*$")
+_OPERATION_ID_LINE = re.compile(r"^\s*operationId\s*:\s*(.+?)\s*$")
+_RESPONSES_LINE = re.compile(r"^\s*responses\s*:\s*$")
+_STATUS_LINE = re.compile(r"""^\s*['"]?(\d{3}|default)['"]?\s*:\s*(?:#.*)?$""")
+_HEADERS_LINE = re.compile(r"^\s*headers\s*:\s*$")
+_HEADER_NAME_LINE = re.compile(r"^\s*([A-Za-z_][\w\-]*)\s*:\s*(?:#.*)?$")
 _CREATE_TABLE = re.compile(r"(?i)^\s*CREATE\s+TABLE\s+([A-Za-z_][\w]*)\s*\(?\s*$")
 _COLUMN_LINE = re.compile(r"^\s*([A-Za-z_][\w]*)\s+([A-Za-z_][\w()<>, \t]*)\s*(.*)$")
 _CLIENT_URL = re.compile(r'https?://[^"\s\)]+')
@@ -303,7 +322,15 @@ def extract_sql_persistence(path: Path) -> list[dict[str, Any]]:
 
 
 def extract_openapi(path: Path) -> list[dict[str, Any]]:
-    """OpenAPI path items and operations declared under ``paths:``."""
+    """OpenAPI path items and operations declared under ``paths:``.
+
+    Each operation record keeps the path/method/span fields and adds
+    the sibling ``operationId`` (``operation_id`` plus
+    ``operation_id_line``, None when absent) and the declared
+    ``responses``: one entry per status code (``status``, ``line``,
+    ``headers`` as ``[{name, line}]``) plus a ``responses_span`` (None
+    when no ``responses:`` block is present).
+    """
     records: list[dict[str, Any]] = []
     lines = path.read_text(encoding="utf-8").splitlines()
     index = 0
@@ -325,17 +352,687 @@ def extract_openapi(path: Path) -> list[dict[str, Any]]:
                 continue
             method_match = _METHOD_LINE.match(line)
             if method_match and current_path is not None:
+                method_indent = len(line) - len(line.lstrip())
+                operation_id: str | None = None
+                operation_id_line: int | None = None
+                responses: list[dict[str, Any]] = []
+                responses_start: int | None = None
+                responses_end: int | None = None
+                resp_indent: int | None = None
+                current: dict[str, Any] | None = None
+                current_indent = 0
+                header_indent: int | None = None
+                scan = index + 1
+                while scan < len(lines):
+                    sline = lines[scan]
+                    if sline.strip():
+                        sindent = len(sline) - len(sline.lstrip())
+                        if sindent <= method_indent:
+                            break
+                        if operation_id is None:
+                            op_match = _OPERATION_ID_LINE.match(sline)
+                            if op_match:
+                                operation_id = op_match.group(1).strip().strip("'\"")
+                                operation_id_line = scan + 1
+                        if resp_indent is None:
+                            if _RESPONSES_LINE.match(sline):
+                                resp_indent = sindent
+                                responses_start = scan + 1
+                                responses_end = scan + 1
+                        else:
+                            status_match = (
+                                _STATUS_LINE.match(sline)
+                                if sindent > resp_indent
+                                else None
+                            )
+                            if status_match:
+                                current = {
+                                    "status": status_match.group(1),
+                                    "line": scan + 1,
+                                    "headers": [],
+                                }
+                                responses.append(current)
+                                current_indent = sindent
+                                header_indent = None
+                                responses_end = scan + 1
+                            elif current is not None:
+                                if header_indent is None:
+                                    if (
+                                        sindent > current_indent
+                                        and _HEADERS_LINE.match(sline)
+                                    ):
+                                        header_indent = sindent
+                                        responses_end = scan + 1
+                                else:
+                                    if sindent > header_indent:
+                                        hname = _HEADER_NAME_LINE.match(sline)
+                                        if hname:
+                                            current["headers"].append({
+                                                "name": hname.group(1),
+                                                "line": scan + 1,
+                                            })
+                                            responses_end = scan + 1
+                                    else:
+                                        header_indent = None
+                    scan += 1
                 records.append({
                     **_base(path, index + 1),
                     "kind": "openapi_operation",
                     "openapi_path": current_path,
                     "method": method_match.group(1),
+                    "operation_id": operation_id,
+                    "operation_id_line": operation_id_line,
+                    "responses": responses,
+                    "responses_span": (
+                        {"start_line": responses_start, "end_line": responses_end}
+                        if responses_start is not None
+                        else None
+                    ),
                     "span": {"start_line": path_start, "end_line": index + 1},
                 })
             index += 1
             continue
         index += 1
     return records
+
+
+# ---------------------------------------------------------------- Java interfaces and implementations
+
+
+_INTERFACE_DECL = re.compile(
+    r"^\s*(?:(?:public|protected|private|abstract|sealed)\s+)*interface\s+([A-Za-z_][\w]*)"
+)
+_INTERFACE_METHOD = re.compile(
+    r"^\s*(?:(?:public|protected|private|static|default|abstract|final|synchronized)\s+)*"
+    r"(?:<[^;{}]*>\s*)?"
+    r"([\w<>\[\]\?,\s\.@]+?)\s+([A-Za-z_][\w]*)\s*\(([^;{}]*)\)"
+    r"\s*(?:throws\s+[\w\.\s,]+)?;\s*$"
+)
+_CLASS_IMPLEMENTS = re.compile(
+    r"^\s*(?:(?:public|protected|private|abstract|final|sealed)\s+)*"
+    r"class\s+([A-Za-z_][\w]*)"
+    r"(?:\s+extends\s+[\w\.,\s<>?]+?)?"
+    r"\s+implements\s+([A-Za-z_][\w]*(?:\s*,\s*[A-Za-z_][\w]*)*)"
+)
+_MODIFIERS = re.compile(
+    r"^(?:\s*(?:public|private|protected|static|final|abstract|synchronized|native|default|transient|volatile)\s+)+"
+)
+_MAPPING_ANNOTATION = re.compile(
+    r"@(?:(Get|Post|Put|Delete|Patch)Mapping|RequestMapping)"
+    r"(?:\(\s*(?:value\s*=\s*)?\"([^\"]*)\"[^)]*\))?"
+)
+_HTTP_STATUS_ENUM = re.compile(r"\bHttpStatus\.([A-Z][A-Z0-9_]*)")
+_STATUS_ENUM_TO_CODE = {
+    "OK": 200,
+    "CREATED": 201,
+    "ACCEPTED": 202,
+    "NO_CONTENT": 204,
+    "BAD_REQUEST": 400,
+    "NOT_FOUND": 404,
+    "CONFLICT": 409,
+    "UNPROCESSABLE_ENTITY": 422,
+    "INTERNAL_SERVER_ERROR": 500,
+}
+_RESPONSE_STATUS_CALL = re.compile(
+    r"\bResponseEntity\s*\.\s*status\s*\(\s*(\d{3})\s*\)"
+)
+_CREATED_CALL = re.compile(r"\.\s*created\s*\(")
+_HEADER_CALL = re.compile(r"\.\s*header\s*\(\s*\"([^\"]+)\"")
+_SET_LOCATION_CALL = re.compile(r"\.\s*setLocation\s*\(")
+_HEADERS_SET_CALL = re.compile(r"\.\s*set\s*\(\s*\"([^\"]+)\"\s*,")
+_MAPPING_METHOD = {
+    "Get": "get",
+    "Post": "post",
+    "Put": "put",
+    "Delete": "delete",
+    "Patch": "patch",
+}
+
+
+def _strip_modifiers(prefix: str) -> str:
+    """Remove leading Java modifiers from a declaration prefix."""
+    text = prefix.strip()
+    while True:
+        stripped = _MODIFIERS.sub("", text, count=1).strip()
+        if stripped == text:
+            return text
+        text = stripped
+
+
+def _decl_return_type(decl_line: str, name: str) -> str | None:
+    """Return type preceding ``name(`` on a declaration line (None for ctors)."""
+    pos = decl_line.find(name + "(")
+    if pos == -1:
+        return None
+    remainder = _strip_modifiers(decl_line[:pos])
+    remainder = re.sub(r"^<[^;{}]*>\s*", "", remainder).strip()
+    return remainder or None
+
+
+def extract_java_interfaces(path: Path) -> list[dict[str, Any]]:
+    """``interface X`` declarations plus ``;``-terminated method signatures.
+
+    Each record names the interface, the method, its raw return type and
+    arity, with file/line/span evidence (regex only, no solver; generic
+    method type parameters are tolerated, multi-line signatures abstain).
+    """
+    records: list[dict[str, Any]] = []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    current: str | None = None
+    current_line = 0
+    depth = 0
+    body_depth: int | None = None
+    for index, line in enumerate(lines, start=1):
+        if current is None:
+            decl = _INTERFACE_DECL.match(line)
+            if decl:
+                current = decl.group(1)
+                current_line = index
+                depth += line.count("{") - line.count("}")
+                body_depth = depth if "{" in line else None
+            continue
+        if body_depth is None:
+            depth += line.count("{") - line.count("}")
+            if "{" in line:
+                body_depth = depth
+            elif re.match(r"^\s*;\s*$", line) or not line.strip():
+                continue
+            else:
+                current = None
+            continue
+        if depth == body_depth:
+            sig = _INTERFACE_METHOD.match(line)
+            if sig and "(" in line:
+                params = sig.group(3).strip()
+                record = dict(_base(path, index))
+                record.update({
+                    "kind": "java_interface",
+                    "interface": current,
+                    "interface_line": current_line,
+                    "method": sig.group(2),
+                    "return_type": sig.group(1).strip(),
+                    "arity": _param_count(params),
+                    "params": params,
+                    "span": {"start_line": index, "end_line": index},
+                })
+                records.append(record)
+        depth += line.count("{") - line.count("}")
+        if depth < (body_depth or 0):
+            current = None
+            body_depth = None
+    return records
+
+
+def extract_implements(path: Path) -> list[dict[str, Any]]:
+    """``class C implements I,...`` plus its method definitions.
+
+    Methods come from :func:`_method_bodies` ( reused, so only braced
+    bodies count); each record carries the impl class, the declared
+    interface names, method name/arity/return type, ``@Override``
+    presence (annotation within the three lines above the declaration),
+    and the body span.
+    """
+    records: list[dict[str, Any]] = []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    decls: list[tuple[int, str, list[str]]] = []
+    for index, line in enumerate(lines, start=1):
+        match = _CLASS_IMPLEMENTS.match(line)
+        if match:
+            decls.append((
+                index,
+                match.group(1),
+                [part.strip() for part in match.group(2).split(",")],
+            ))
+    if not decls:
+        return []
+    try:
+        bodies = _method_bodies(path)
+    except (OSError, UnicodeError):
+        return []
+    for body in bodies:
+        owner: tuple[int, str, list[str]] | None = None
+        for decl in decls:
+            if decl[0] < body["decl"]:
+                owner = decl
+            else:
+                break
+        if owner is None:
+            continue
+        decl_line = lines[body["decl"] - 1]
+        override = any(
+            lines[k].strip().startswith("@Override")
+            for k in range(max(0, body["decl"] - 4), body["decl"] - 1)
+        )
+        end_line = body["base"] + len(body["lines"]) - 1
+        record = dict(_base(path, body["decl"]))
+        record.update({
+            "kind": "java_implementation",
+            "class": owner[1],
+            "interfaces": list(owner[2]),
+            "method": body["name"],
+            "arity": int(body.get("param_count", 0)),
+            "return_type": _decl_return_type(decl_line, body["name"]),
+            "override": override,
+            "span": {"start_line": body["decl"], "end_line": max(end_line, body["decl"])},
+        })
+        records.append(record)
+    return records
+
+
+def _impl_response_construction(
+    file_text: list[str], start: int, end: int
+) -> dict[str, Any] | None:
+    """Response-construction evidence inside impl body lines (1-based span).
+
+    Detects ``ResponseEntity.status(NNN)``, ``HttpStatus.X`` enums (mapped
+    to codes), ``.created(`` (201), ``.header("Name")``,
+    ``.setLocation(`` (Location) and ``HttpHeaders.set("Name", ...)``.
+    Returns None when nothing is found (abstain, never synthesize).
+    """
+    statuses: list[dict[str, Any]] = []
+    headers: list[dict[str, Any]] = []
+    for num in range(start, end + 1):
+        if not 1 <= num <= len(file_text):
+            continue
+        text = file_text[num - 1]
+        for match in _RESPONSE_STATUS_CALL.finditer(text):
+            statuses.append({"status": int(match.group(1)), "line": num})
+        for match in _HTTP_STATUS_ENUM.finditer(text):
+            code = _STATUS_ENUM_TO_CODE.get(match.group(1))
+            if code is not None:
+                statuses.append({"status": code, "line": num})
+        if _CREATED_CALL.search(text) and not any(
+            s["line"] == num and s["status"] == 201 for s in statuses
+        ):
+            statuses.append({"status": 201, "line": num})
+        for match in _HEADER_CALL.finditer(text):
+            headers.append({"name": match.group(1), "line": num})
+        if _SET_LOCATION_CALL.search(text):
+            headers.append({"name": "Location", "line": num})
+        for match in _HEADERS_SET_CALL.finditer(text):
+            headers.append({"name": match.group(1), "line": num})
+    if not statuses and not headers:
+        return None
+    bound = [entry["line"] for entry in statuses + headers]
+    return {
+        "statuses": statuses,
+        "headers": headers,
+        "span": {"start_line": min(bound), "end_line": max(bound)},
+    }
+
+
+def _impl_mapping_clues(
+    file_text: list[str], decl_line: int
+) -> tuple[str | None, str | None]:
+    """Method-level mapping annotation just above ``decl_line``.
+
+    Returns ``(http_method, path)`` where each is None when the
+    annotation is absent (RequestMapping without a method yields a None
+    method, never a guess).
+    """
+    for num in range(max(1, decl_line - 3), decl_line):
+        if not 1 <= num <= len(file_text):
+            continue
+        match = _MAPPING_ANNOTATION.search(file_text[num - 1])
+        if match:
+            kind, value = match.group(1), match.group(2)
+            method = _MAPPING_METHOD.get(kind) if kind else None
+            return method, value
+    return None, None
+
+
+def bind_operation_to_implementation(
+    openapi_op: dict[str, Any],
+    interfaces: list[dict[str, Any]],
+    implementations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind one OpenAPI operation to its Java implementation, if provable.
+
+    ``full`` requires all three: (a) the operationId names an interface
+    method from a present interface file, (b) a class implementing that
+    interface defines a same-name method with compatible (equal) arity,
+    and (c) at least one corroboration -- the OpenAPI path cited in the
+    impl file or a matching interface/impl return type -- plus an impl
+    status inside the declared responses. A missing interface file is
+    ``partial`` (declared + impl present, interface unresolved, never
+    full); name-only matches (arity/signature mismatch, path/method
+    contradiction, or no corroboration) are ``unresolved``; two or more
+    implementors abstain as ambiguous; an impl status outside the
+    declared responses is ``partial`` with ``response_supported`` False.
+    Client invocation, destination, and delivery are never proved
+    (explicit False fields).
+    """
+    try:
+        op_file = Path(str(openapi_op.get("file", "")))
+        op_base = dict(_base(op_file, int(openapi_op.get("line", 1))))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        op_base = {
+            "origin": ORIGIN,
+            "extractor_version": EXTRACTOR_VERSION,
+            "file": str(openapi_op.get("file", "")),
+            "line": openapi_op.get("line", 1),
+            "content_hash": "",
+        }
+    declared = {
+        "method": openapi_op.get("method"),
+        "path": openapi_op.get("openapi_path"),
+        "operation_id": openapi_op.get("operation_id"),
+        "responses": openapi_op.get("responses", []),
+        "spans": {
+            "operation": openapi_op.get("span"),
+            "operation_id_line": openapi_op.get("operation_id_line"),
+            "responses_span": openapi_op.get("responses_span"),
+        },
+    }
+    not_proved = (
+        "operation match only (path+method/name/signature evidence); "
+        "client invocation, destination, and delivery are NOT proved"
+    )
+
+    def _result(
+        binding: str,
+        reason: str,
+        interface: dict[str, Any] | None,
+        implementation: dict[str, Any] | None,
+        response_construction: dict[str, Any] | None,
+        response_supported: bool,
+    ) -> dict[str, Any]:
+        record = dict(op_base)
+        record.update({
+            "kind": "operation_binding",
+            "declared": declared,
+            "interface": interface,
+            "implementation": implementation,
+            "response_construction": response_construction,
+            "response_supported": response_supported,
+            "binding": binding,
+            "verified": binding == "full",
+            "reason": f"{reason}; {not_proved}",
+            "client_invocation_proved": False,
+            "destination_verified": False,
+            "delivery_proved": False,
+            "span": openapi_op.get("span", {
+                "start_line": openapi_op.get("line", 1),
+                "end_line": openapi_op.get("line", 1),
+            }),
+        })
+        return record
+
+    op_id = openapi_op.get("operation_id")
+    if not op_id or not str(op_id).strip():
+        return _result(
+            "unresolved", "no bind: operation has no operationId",
+            None, None, None, False,
+        )
+    op_id = str(op_id)
+    iface_hits = [i for i in interfaces if i.get("method") == op_id]
+    impl_hits = [m for m in implementations if m.get("method") == op_id]
+
+    def _construction(
+        impl: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        info = {
+            "file": impl.get("file"),
+            "line": impl.get("line"),
+            "signature": (
+                f"{impl.get('return_type')} {impl.get('method')}"
+                f"({impl.get('arity')} params)"
+                if impl.get("return_type") else None
+            ),
+            "class": impl.get("class"),
+            "override": impl.get("override"),
+        }
+        try:
+            text = Path(str(impl.get("file"))).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return info, None
+        span = impl.get("span") or {}
+        start = int(span.get("start_line", impl.get("line", 1)))
+        end = int(span.get("end_line", start))
+        return info, _impl_response_construction(text, start, end)
+
+    def _supported(
+        declared_responses: list[dict[str, Any]],
+        construction: dict[str, Any] | None,
+    ) -> bool:
+        if not construction:
+            return False
+        declared_codes = {
+            str(r.get("status")) for r in declared_responses or []
+        }
+        if "default" in declared_codes:
+            return bool(construction.get("statuses"))
+        return any(
+            str(s.get("status")) in declared_codes
+            for s in construction.get("statuses", [])
+        )
+
+    if not iface_hits:
+        if not impl_hits:
+            return _result(
+                "unresolved",
+                f"no bind: operationId {op_id!r} matches no source "
+                "interface method and no implementation method",
+                {"file": None, "line": None,
+                 "reason": "interface-unresolved: no source interface declares "
+                 f"{op_id!r}"},
+                None, None, False,
+            )
+        distinct = {(m.get("file"), m.get("class")) for m in impl_hits}
+        if len(distinct) > 1:
+            return _result(
+                "unresolved",
+                f"no verified bind: {len(distinct)} implementations share "
+                f"method name {op_id!r} with no resolving interface "
+                "(ambiguous-multiple-implementations, abstain)",
+                {"file": None, "line": None,
+                 "reason": "interface-unresolved: no source interface declares "
+                 f"{op_id!r}"},
+                None, None, False,
+            )
+        impl = impl_hits[0]
+        info, construction = _construction(impl)
+        return _result(
+            "partial",
+            f"partial: operationId {op_id!r} matches implementation "
+            f"{impl.get('class')}.{impl.get('method')} but no source "
+            "interface file declares it (interface-unresolved, never full)",
+            {"file": None, "line": None,
+             "reason": "interface-unresolved: no source interface declares "
+             f"{op_id!r}"},
+            info, construction,
+            _supported(declared["responses"], construction),
+        )
+
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for iface in iface_hits:
+        for impl in impl_hits:
+            if iface.get("interface") in (impl.get("interfaces") or []) and impl.get(
+                "arity"
+            ) == iface.get("arity"):
+                pairs.append((iface, impl))
+    if len({(p[1].get("file"), p[1].get("class")) for p in pairs}) > 1:
+        return _result(
+            "unresolved",
+            f"no verified bind: {len(pairs)} implementations match interface "
+            f"method {op_id!r} (ambiguous-multiple-implementations, abstain)",
+            {"file": iface_hits[0].get("file"), "line": iface_hits[0].get("line")},
+            None, None, False,
+        )
+    if len(pairs) == 1:
+        iface, impl = pairs[0]
+        info, construction = _construction(impl)
+        try:
+            file_text = Path(str(impl.get("file"))).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            op_path = str(openapi_op.get("openapi_path") or "")
+            op_method = str(openapi_op.get("method") or "").strip().lower()
+            impl_line = int(impl.get("line", 1))
+            map_method, map_path = _impl_mapping_clues(file_text, impl_line)
+            if map_method and op_method and map_method != op_method:
+                return _result(
+                    "unresolved",
+                    f"no bind: name {op_id!r} matches interface "
+                    f"{iface.get('interface')} and implementation "
+                    f"{impl.get('class')} but method contradicts "
+                    f"(impl @{map_method.upper()} vs openapi "
+                    f"{op_method.upper()}; mapping contradiction, no bind)",
+                    {"file": iface.get("file"), "line": iface.get("line")},
+                    info, construction,
+                    _supported(declared["responses"], construction),
+                )
+            span = impl.get("span") or {}
+            try:
+                span_start = int(span.get("start_line", impl_line))
+            except (TypeError, ValueError):
+                span_start = impl_line
+            try:
+                span_end = int(span.get("end_line", span_start))
+            except (TypeError, ValueError):
+                span_end = span_start
+            quoted_double = f'"{op_path}"' if op_path else ""
+            quoted_single = f"'{op_path}'" if op_path else ""
+            scope_nums = set(range(span_start, span_end + 1)) | set(
+                range(max(1, impl_line - 3), impl_line)
+            )
+            path_lines: list[int] = sorted(
+                num
+                for num in scope_nums
+                if 1 <= num <= len(file_text)
+                and bool(op_path)
+                and (
+                    (quoted_double and quoted_double in file_text[num - 1])
+                    or (quoted_single and quoted_single in file_text[num - 1])
+                )
+            )
+            path_match = bool(path_lines)
+            body_cited = any(
+                1 <= num <= len(file_text)
+                and bool(op_path)
+                and (
+                    (quoted_double and quoted_double in file_text[num - 1])
+                    or (quoted_single and quoted_single in file_text[num - 1])
+                )
+                for num in range(span_start, span_end + 1)
+            )
+            if (
+                map_path
+                and op_path
+                and map_path != op_path
+                and not body_cited
+            ):
+                return _result(
+                    "unresolved",
+                    f"no bind: name {op_id!r} matches interface "
+                    f"{iface.get('interface')} and implementation "
+                    f"{impl.get('class')} but path contradicts "
+                    f"(impl {map_path!r} vs openapi {op_path!r}; "
+                    "mapping contradiction, no bind)",
+                    {"file": iface.get("file"), "line": iface.get("line")},
+                    info, construction,
+                    _supported(declared["responses"], construction),
+                )
+        except (OSError, UnicodeError, ValueError, TypeError):
+            file_text = []
+            path_match = False
+            path_lines = []
+        iface_ret = str(iface.get("return_type") or "").strip()
+        impl_ret = str(impl.get("return_type") or "").strip()
+        return_match = bool(iface_ret) and iface_ret == impl_ret
+        if not (path_match or return_match):
+            return _result(
+                "unresolved",
+                f"no bind: name {op_id!r} matches interface "
+                f"{iface.get('interface')} and implementation "
+                f"{impl.get('class')} but no corroboration (no path citation, "
+                "no return-type match; name-only, abstain)",
+                {"file": iface.get("file"), "line": iface.get("line")},
+                info, construction,
+                _supported(declared["responses"], construction),
+            )
+        supported = _supported(declared["responses"], construction)
+        if not supported:
+            return _result(
+                "partial",
+                f"partial: {op_id!r} binds interface "
+                f"{iface.get('interface')} to {impl.get('class')} "
+                "(path/return corroborated) but the constructed status is "
+                "outside the declared responses (response-unsupported)",
+                {"file": iface.get("file"), "line": iface.get("line")},
+                info, construction, False,
+            )
+        return _result(
+            "full",
+            f"full: operationId {op_id!r} == interface "
+            f"{iface.get('interface')}.{iface.get('method')} "
+            f"(arity {iface.get('arity')}) == implementation "
+            f"{impl.get('class')}.{impl.get('method')}"
+            + (
+                f" with path citation (lines {path_lines[0]}-{path_lines[-1]})"
+                if path_match
+                else ""
+            )
+            + (
+                " with return-type match"
+                if return_match
+                else ""
+            ),
+            {"file": iface.get("file"), "line": iface.get("line")},
+            info, construction, True,
+        )
+
+    same_name = impl_hits
+    arity_clash = any(
+        m.get("arity") != iface.get("arity")
+        for m in same_name
+        for iface in iface_hits
+        if iface.get("interface") in (m.get("interfaces") or [])
+    )
+    if arity_clash:
+        cause = (
+            f"name {op_id!r} matches but arity/signature mismatches "
+            "(name-only, no bind)"
+        )
+    else:
+        contradiction: str | None = None
+        for m in same_name:
+            try:
+                text = Path(str(m.get("file"))).read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            except (OSError, UnicodeError):
+                continue
+            map_method, map_path = _impl_mapping_clues(text, int(m.get("line", 1)))
+            op_method = str(openapi_op.get("method") or "").strip().lower()
+            op_path = str(openapi_op.get("openapi_path") or "")
+            if map_method and op_method and map_method != op_method:
+                contradiction = (
+                    f"method contradicts (impl @{map_method.upper()} vs "
+                    f"openapi {op_method.upper()})"
+                )
+                break
+            if (
+                map_path
+                and op_path
+                and map_path != op_path
+                and not any(op_path in line for line in text)
+            ):
+                contradiction = (
+                    f"path contradicts (impl {map_path!r} vs openapi {op_path!r})"
+                )
+                break
+        cause = (
+            f"name {op_id!r} matches but {contradiction} (name-only, no bind)"
+            if contradiction
+            else f"name {op_id!r} declared by an interface but no class "
+            "implements it with a compatible signature (no-implementor, no bind)"
+        )
+    return _result(
+        "unresolved", f"no bind: {cause}",
+        {"file": iface_hits[0].get("file"), "line": iface_hits[0].get("line")},
+        None, None, False,
+    )
 
 
 # ---------------------------------------------------------------- client URLs
