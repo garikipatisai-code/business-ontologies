@@ -99,10 +99,13 @@ class TestGuardPrecedence:
         assert true_t["guard_if_line"] < true_t["line"]
 
         late_t = found["LATE"]
-        assert late_t["guard"] is None or (
-            late_t["guard_if_line"] is not None
-            and late_t["guard_if_line"] < late_t["line"]
-        ), f"post-write guard back-attributed: {late_t!r}"
+        assert late_t["guard"] is None, f"post-write guard back-attributed: {late_t!r}"
+        assert late_t["enforcement_lines"] == [], (
+            f"late write must cite no enforcement: {late_t!r}"
+        )
+        assert late_t["coverage"] == "none", (
+            f"late write must have no coverage: {late_t!r}"
+        )
 
         bare_t = found["BARE"]
         assert bare_t["guard"] is None, (
@@ -114,8 +117,24 @@ class TestGuardPrecedence:
 
 
 def _client_record(tmp_path: Path, url: str, method: str | None) -> dict:
+    # Honest contract: compatible True requires invocation evidence (a
+    # supported RestTemplate call line). Explicit method alone yields a
+    # candidate (compatible False, no-invocation). Records here carry a
+    # matching invocation so path+method matches can prove compatibility.
     src = tmp_path / "Client.java"
-    src.write_text(f'var u = "{url}";\n', encoding="utf-8")
+    lowered = str(method).strip().lower() if method is not None else None
+    if lowered == "post":
+        src.write_text(
+            f'var u = "{url}";\nrestTemplate.postForObject(u, request, Void.class);\n',
+            encoding="utf-8",
+        )
+    elif lowered == "get":
+        src.write_text(
+            f'var u = "{url}";\nrestTemplate.getForObject(u, String.class);\n',
+            encoding="utf-8",
+        )
+    else:
+        src.write_text(f'var u = "{url}";\n', encoding="utf-8")
     record = {"url": url, "file": str(src), "line": 1, "method": method}
     return record
 
@@ -784,3 +803,231 @@ class TestLinkHardening:
             assert "ambiguous" in str(lk.get("reason", "")).lower(), (
                 f"duplicate destination must cite ambiguity: {lk!r}"
             )
+
+
+# ---------------------------------------------------------------- window-predicate span + helper proof
+
+
+_WINDOW_JAVA = """\
+public class RefundWindowService {
+    boolean isEligible(String paidAt, long windowDays) {
+        if (paidAt == null) {
+            return false;
+        }
+        long days = daysSince(paidAt);
+        return days <= windowDays;
+    }
+    void applyRefund(Order order) {
+        if (!isEligible(order.getPaidAt(), 30)) {
+            throw new IllegalStateException("not eligible");
+        }
+        order.setRefundStatus("REFUNDED");
+    }
+}
+"""
+
+
+def _window_markers(src: Path) -> dict[str, int]:
+    lines = src.read_text(encoding="utf-8").splitlines()
+    return {
+        "null_line": next(
+            i + 1 for i, t in enumerate(lines) if "paidAt == null" in t
+        ),
+        "pred_line": next(
+            i + 1 for i, t in enumerate(lines) if "days <= windowDays" in t
+        ),
+        "def_line": next(
+            i + 1 for i, t in enumerate(lines) if "boolean isEligible(" in t
+        ),
+        "caller_line": next(
+            i + 1 for i, t in enumerate(lines) if "!isEligible(" in t
+        ),
+    }
+
+
+class TestWindowPredicateSpan:
+    """Window predicate must be cited in the enforcement span (RED-first)."""
+
+    def test_window_predicate_cited_and_rejection_distinguished(
+        self, tmp_path
+    ):
+        src = tmp_path / "RefundWindowService.java"
+        src.write_text(_WINDOW_JAVA, encoding="utf-8")
+        enforced, _ = extract_guards(src)
+        marks = _window_markers(src)
+        rule = next(
+            r for r in enforced if r["guard_if_line"] == marks["null_line"]
+        )
+        assert rule["condition"] == "days <= windowDays"
+        assert marks["pred_line"] in rule["enforcement_lines"], (
+            f"predicate omitted from enforcement (span stops at rejection): {rule!r}"
+        )
+        assert rule["span"] == {
+            "start_line": marks["null_line"],
+            "end_line": marks["pred_line"],
+        }, f"span must cover guard through true comparison: {rule!r}"
+        assert rule["failure_outcome"] == "false return"
+        caller = next(
+            r for r in enforced if r["guard_if_line"] == marks["caller_line"]
+        )
+        assert caller["failure_outcome"] == "rejection"
+
+
+class TestHelperLinkProof:
+    """Helper-guard attribution needs def resolution, not name-only match."""
+
+    def test_helper_call_cites_def_and_callee_predicate(self, tmp_path):
+        src = tmp_path / "RefundWindowService.java"
+        src.write_text(_WINDOW_JAVA, encoding="utf-8")
+        enforced, _ = extract_guards(src)
+        marks = _window_markers(src)
+        caller = next(
+            r for r in enforced if r["guard_if_line"] == marks["caller_line"]
+        )
+        assert caller["guard"] == "isEligible"
+        assert caller["helper_def_line"] == marks["def_line"], (
+            f"helper def not resolved: {caller!r}"
+        )
+        assert caller["callee_predicate_line"] == marks["pred_line"], (
+            f"callee predicate not cited separately: {caller!r}"
+        )
+        assert caller["callee_condition"] == "days <= windowDays"
+
+    def test_name_only_call_without_def_abstains_from_predicate(
+        self, tmp_path
+    ):
+        src = tmp_path / "NameOnlyService.java"
+        src.write_text(
+            "public class NameOnlyService {\n"
+            "    void apply(Order order) {\n"
+            "        if (!isEligible(order.getPaidAt())) {\n"
+            '            throw new IllegalStateException("not eligible");\n'
+            "        }\n"
+            '        order.setRefundStatus("REFUND");\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        enforced, _ = extract_guards(src)
+        caller = next(
+            r
+            for r in enforced
+            if r.get("guard") == "isEligible"
+        )
+        assert caller["guard"] == "isEligible"
+        assert caller["helper_def_line"] is None, (
+            f"unresolvable helper must not claim a def: {caller!r}"
+        )
+        assert caller["callee_predicate_line"] is None, (
+            f"unresolvable helper must not attribute a predicate: {caller!r}"
+        )
+
+
+# ---------------------------------------------------------------- guard prerequisites
+
+
+class TestGuardPrerequisites:
+    """Contained write keeps its controlling guard plus dominating prerequisites."""
+
+    def test_contained_write_reports_guard_plus_prerequisites(
+        self, tmp_path
+    ):
+        src = tmp_path / "ChainService.java"
+        src.write_text(
+            "public class ChainService {\n"
+            "    boolean isFirst(String paidAt) {\n"
+            "        return paidAt != null;\n"
+            "    }\n"
+            "    boolean isSecond(String paidAt) {\n"
+            "        return paidAt != null;\n"
+            "    }\n"
+            "    void applyChain(Order order) {\n"
+            "        if (!isFirst(order.getPaidAt())) {\n"
+            '            throw new IllegalStateException("no first");\n'
+            "        }\n"
+            "        if (!isSecond(order.getPaidAt())) {\n"
+            '            throw new IllegalStateException("no second");\n'
+            "        }\n"
+            "        if (order.getTotal() != null) {\n"
+            '            order.setRefundStatus("CHAINED");\n'
+            "        }\n"
+            "    }\n"
+            "    void applyBare(Order order) {\n"
+            '        order.setRefundStatus("BARE2");\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        _, transitions = extract_guards(src)
+        lines = src.read_text(encoding="utf-8").splitlines()
+        first_line = next(
+            i + 1 for i, t in enumerate(lines) if "!isFirst(" in t
+        )
+        second_line = next(
+            i + 1 for i, t in enumerate(lines) if "!isSecond(" in t
+        )
+        cont_line = next(
+            i + 1 for i, t in enumerate(lines) if "order.getTotal() != null" in t
+        )
+        chained = next(
+            t for t in transitions if t["target_status"] == "CHAINED"
+        )
+        assert chained["guard"] == "order.getTotal() != null"
+        assert chained["guard_if_line"] == cont_line, (
+            f"controlling containment guard must be kept: {chained!r}"
+        )
+        pre_lines = {p["guard_if_line"] for p in chained["prerequisites"]}
+        assert pre_lines == {first_line, second_line}, (
+            f"dominating rejections missing from prerequisites: {chained!r}"
+        )
+        assert chained["coverage"] != "none"
+        bare = next(t for t in transitions if t["target_status"] == "BARE2")
+        assert bare["guard"] is None, (
+            f"unguarded write must stay unguarded: {bare!r}"
+        )
+        assert bare["prerequisites"] == []
+        assert bare["coverage"] == "none"
+
+
+# ---------------------------------------------------------------- link destination labeling
+
+
+class TestLinkDestinationLabeling:
+    """Compatible links stay operation matches and label destination unverified."""
+
+    def test_compatible_link_carries_invocation_match_and_destination(
+        self, tmp_path
+    ):
+        java = (
+            "public class InvoiceClient {\n"
+            "    private final RestTemplate restTemplate = new RestTemplate();\n"
+            f'    private String billingBaseUrl = "{_BILLING_BASE}";\n'
+            "    public void submitInvoice(Object request) {\n"
+            '        String url = billingBaseUrl + "/invoices/submit";\n'
+            "        restTemplate.postForObject(url, request, Void.class);\n"
+            "    }\n"
+            "}\n"
+        )
+        src, urls, op, links = _links_for_client(java, tmp_path)
+        lines = src.read_text(encoding="utf-8").splitlines()
+        call = next(
+            i + 1 for i, t in enumerate(lines) if "postForObject(url" in t
+        )
+        compat = [lk for lk in links if lk.get("compatible") is True]
+        assert len(compat) == 1, f"expected one compatible POST link: {links!r}"
+        link = compat[0]
+        assert link["equivalent"] is False
+        assert link["client_call_line"] == call
+        assert link["destination_verified"] is False, (
+            f"destination must be marked unverified: {link!r}"
+        )
+        assert link["destination_evidence"] == "billing.local", (
+            f"destination evidence must cite the hostname: {link!r}"
+        )
+        reason = link.get("reason", "")
+        assert "billing.local" in reason, (
+            f"reason must cite the destination host: {reason!r}"
+        )
+        assert "operation-only" in reason.lower(), (
+            f"reason must state operation-only scope: {reason!r}"
+        )

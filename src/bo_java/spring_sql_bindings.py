@@ -400,7 +400,7 @@ def extract_client_urls(path: Path) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------- Java guards and transitions
 
 _METHOD_WITH_BODY = re.compile(
-    r"^\s*(?:public|private|protected|static\s+)*(?:[\w<>\[\]\s,\?\.]*)\s+([A-Za-z_][\w]*)\s*\([^)]*\)\s*(?:throws\s+[\w\.\[\]\s,]+)?\s*\{?\s*$"
+    r"^\s*(?:public|private|protected|static\s+)*(?:[\w<>\[\]\s,\?\.]*)\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*(?:throws\s+[\w\.\[\]\s,]+)?\s*\{?\s*$"
 )
 _IF_OPEN = re.compile(r"\bif\s*\(")
 _GUARD_CALL = re.compile(r"\b([A-Za-z_][\w]*)\s*\(")
@@ -429,6 +429,90 @@ def _if_condition(line: str) -> str | None:
     return None
 _RETURN_STMT = re.compile(r"^\s*return\s+([^;]+?)\s*;")
 _COMPARE = re.compile(r"\b([A-Za-z_][\w]*)\s*(<=|>=|==|<|>)\s*([A-Za-z_][\w]*)")
+
+
+def _is_window_compare(left: str, op: str, right: str) -> bool:
+    """Window-shaped comparison: ``<=`` with a window/days token.
+
+    Only a ``<=`` comparison naming a window/days value (e.g. ``days <=
+    windowDays``) counts as a window predicate; any other comparison
+    (``==``, ``<``, ``>``, ...) or any ``<=`` without such a token
+    abstains (not a window predicate).
+    """
+    if op != "<=":
+        return False
+    blob = f"{left} {right}".lower()
+    return ("window" in blob or "day" in blob)
+
+
+def _param_count(params_text: str) -> int:
+    """Top-level comma count for a method-declaration parameter list."""
+    text = (params_text or "").strip()
+    if not text:
+        return 0
+    depth_angle = depth_paren = depth_brack = 0
+    in_str: str | None = None
+    count = 1
+    for ch in text:
+        if in_str is not None:
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+        elif ch == "<":
+            depth_angle += 1
+        elif ch == ">":
+            if depth_angle > 0:
+                depth_angle -= 1
+        elif ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            if depth_paren > 0:
+                depth_paren -= 1
+        elif ch == "[":
+            depth_brack += 1
+        elif ch == "]":
+            if depth_brack > 0:
+                depth_brack -= 1
+        elif ch == "," and depth_angle == 0 and depth_paren == 0 and depth_brack == 0:
+            count += 1
+    return count
+
+
+def _call_arg_count(condition_text: str, name: str) -> int | None:
+    """Top-level argument count for the first ``name(...)`` call."""
+    match = re.search(r"\b" + re.escape(name) + r"\s*\(", condition_text)
+    if not match:
+        return None
+    pos = match.end() - 1
+    depth = 0
+    commas = 0
+    seen_content = False
+    in_str: str | None = None
+    for idx in range(pos, len(condition_text)):
+        ch = condition_text[idx]
+        if in_str is not None:
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            if depth == 1:
+                seen_content = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return (commas + 1) if seen_content else 0
+            if depth < 0:
+                return None
+        elif ch == "," and depth == 1:
+            commas += 1
+        elif ch.strip() and depth == 1:
+            seen_content = True
+    return None
 _THROW = re.compile(r"\bthrow\b")
 _FALSE_RETURN = re.compile(r"\breturn\s+false\b")
 _SET_STATUS = re.compile(
@@ -481,6 +565,8 @@ def _method_bodies(path: Path) -> list[dict[str, Any]]:
             j += 1
         bodies.append({
             "name": match.group(1),
+            "decl": index + 1,
+            "param_count": _param_count(match.group(2) if match.lastindex is not None and match.lastindex >= 2 else ""),
             "lines": lines[brace_line + 1:end],
             "base": brace_line + 2,
         })
@@ -607,10 +693,62 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
     containing guard, guard-after-write only) carries ``guard None`` with
     empty enforcement -- no guard is synthesized, and a preceding
     same-block ``if`` that does not contain the write never governs it.
+
+    Evidence extras (all additive): an enforced rule cites the method's true
+    comparison (``return days <= windowDays``) in ``enforcement_lines``/span
+    even when the failure-branch scan stops earlier; a caller-side guard
+    naming a helper resolves the helper def (``helper_def_line``) and cites
+    the callee's own comparison separately (``callee_condition`` /
+    ``callee_predicate_line``), abstaining (None) when unresolvable; every
+    transition carries ``prerequisites`` (dominating prior rejections: same
+    method, guard_if < write, guard parent an ancestor-prefix of the write
+    parent, enforced rejection) and a ``coverage`` label
+    (``contained[-with-prerequisites]`` / ``prior-partial`` / ``none``).
     """
     enforced: list[dict[str, Any]] = []
     transitions: list[dict[str, Any]] = []
     bodies = _method_bodies(path)
+    # Helper-method predicate index: (name, param-count) -> (decl line,
+    # window comparison, predicate line). Lets a caller-side guard citing a
+    # helper (``if (!isEligible(...))``) prove the link: helper def line
+    # plus the callee's own comparison, cited separately from the call
+    # line. Keyed by (name, arity) so overloads do not collide
+    # (first-wins by bare name would misattribute); only a single
+    # window-shaped (``<=`` + window/days token) ``return`` comparison
+    # counts -- zero or multiple candidates abstain (None): no name-only
+    # predicate attribution, and an unrelated early ``return a==b`` can
+    # never be cited as a window predicate.
+    helper_predicates: dict[tuple[str, int], dict[str, Any]] = {}
+    for _body in bodies:
+        _hlines = _body["lines"]
+        _hbase = _body["base"]
+        _hcands: list[tuple[str, int]] = []
+        for _hoff, _hline in enumerate(_hlines):
+            _hmatch = _RETURN_STMT.match(_hline)
+            if not _hmatch:
+                continue
+            _hcompare = _COMPARE.search(_hmatch.group(1))
+            if _hcompare and _is_window_compare(
+                _hcompare.group(1), _hcompare.group(2), _hcompare.group(3)
+            ):
+                _hcands.append(
+                    (
+                        f"{_hcompare.group(1)} "
+                        f"{_hcompare.group(2)} {_hcompare.group(3)}",
+                        _hbase + _hoff,
+                    )
+                )
+        if len(_hcands) == 1:
+            _hcond, _hcond_line = _hcands[0]
+        else:
+            _hcond, _hcond_line = None, None
+        _hkey = (_body["name"], int(_body.get("param_count", 0)))
+        if _hkey not in helper_predicates:
+            helper_predicates[_hkey] = {
+                "decl": _body.get("decl"),
+                "condition": _hcond,
+                "condition_line": _hcond_line,
+            }
     for body in bodies:
         lines = body["lines"]
         base = body["base"]
@@ -652,15 +790,31 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                     if len(eff) > 1:
                         eff.pop()
             return tuple(eff)
-        condition: str | None = None
-        condition_line: int | None = None
-        for offset, line in enumerate(lines):
-            match = _RETURN_STMT.match(line)
-            if match and condition is None:
-                compare = _COMPARE.search(match.group(1))
-                if compare:
-                    condition = f"{compare.group(1)} {compare.group(2)} {compare.group(3)}"
-                    condition_line = base + offset
+        # Per-body window candidates: only single window-shaped
+        # (``<=`` + window/days) ``return`` comparisons count; zero or
+        # multiple abstain. Per-guard scoping below cites the candidate
+        # only when its line is after the guard_if (never an unrelated
+        # early ``return a==b``, which also fails the window shape).
+        _window_cands: list[tuple[str, int]] = []
+        for _w_off, _w_line in enumerate(lines):
+            _w_match = _RETURN_STMT.match(_w_line)
+            if not _w_match:
+                continue
+            _w_compare = _COMPARE.search(_w_match.group(1))
+            if _w_compare and _is_window_compare(
+                _w_compare.group(1), _w_compare.group(2), _w_compare.group(3)
+            ):
+                _window_cands.append(
+                    (
+                        f"{_w_compare.group(1)} "
+                        f"{_w_compare.group(2)} {_w_compare.group(3)}",
+                        base + _w_off,
+                    )
+                )
+        if len(_window_cands) == 1:
+            _body_window_cond, _body_window_line = _window_cands[0]
+        else:
+            _body_window_cond, _body_window_line = None, None
         body_guards: list[dict[str, Any]] = []
         body_positive: list[dict[str, Any]] = []
         for offset, line in enumerate(lines):
@@ -734,31 +888,62 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                         break
             if failure is None:
                 continue
+            # Per-guard window predicate: cite the body's single
+            # window-shaped comparison only when it lies after this
+            # guard_if. An unrelated early ``return a==b`` (before the
+            # guard, wrong shape, or ambiguous multiples) abstains.
+            per_guard_condition: str | None = None
+            per_guard_condition_line: int | None = None
+            if (
+                _body_window_cond is not None
+                and _body_window_line is not None
+                and _body_window_line > guard_line
+            ):
+                per_guard_condition = _body_window_cond
+                per_guard_condition_line = _body_window_line
             enforcement = [guard_line]
             if failure_line is not None and failure_line not in enforcement:
                 enforcement.append(failure_line)
-            if condition_line is not None:
-                cond_offset = condition_line - base
-                if cond_offset in scanned:
-                    enforcement.append(condition_line)
+            if per_guard_condition_line is not None and per_guard_condition_line not in enforcement:
+                # The method's true comparison (e.g. ``return days <=
+                # windowDays``) is enforcement evidence even when the scan
+                # for the failure branch stops earlier (e.g. at an early
+                # ``return false`` null-check): the span must cover guard
+                # through predicate instead of omitting it.
+                enforcement.append(per_guard_condition_line)
             call = _GUARD_CALL.search(condition_text)
             if call:
                 guard_name = call.group(1)
             else:
-                guard_name = (condition or condition_text.strip())
+                guard_name = (per_guard_condition or condition_text.strip())
                 if not guard_name.strip():
                     continue
+            helper_def_line: int | None = None
+            callee_condition: str | None = None
+            callee_predicate_line: int | None = None
+            if call:
+                _cname = call.group(1)
+                _argc = _call_arg_count(condition_text, _cname)
+                if _argc is not None:
+                    helper_info = helper_predicates.get((_cname, _argc))
+                    if helper_info is not None and helper_info.get("condition_line") is not None:
+                        helper_def_line = helper_info.get("decl")
+                        callee_condition = helper_info.get("condition")
+                        callee_predicate_line = helper_info.get("condition_line")
             enforcement = sorted(set(enforcement))
             record = dict(_base(path, guard_line))
             record.update({
                 "kind": "enforced_rule",
                 "rule": "window_guard",
-                "condition": condition or (condition_text or "").strip(),
+                "condition": per_guard_condition or (condition_text or "").strip(),
                 "failure_outcome": failure,
                 "guard": guard_name,
                 "guard_if_line": guard_line,
                 "enforcement_lines": enforcement,
                 "span": {"start_line": enforcement[0], "end_line": enforcement[-1]},
+                "helper_def_line": helper_def_line,
+                "callee_condition": callee_condition,
+                "callee_predicate_line": callee_predicate_line,
             })
             enforced.append(record)
             body_guards.append({
@@ -767,6 +952,7 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                 "enforcement_lines": enforcement,
                 "guard_depth": guard_depth,
                 "guard_parent": guard_parent,
+                "failure": failure,
             })
         for offset, line in enumerate(lines):
             status = _SET_STATUS.search(line)
@@ -790,6 +976,20 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                     contained = pg
                     break
             if contained is not None:
+                prerequisites = [
+                    {
+                        "guard": g["guard"],
+                        "guard_if_line": g["guard_if_line"],
+                        "enforcement_lines": list(g["enforcement_lines"]),
+                    }
+                    for g in body_guards
+                    if g["guard_if_line"] < status_line
+                    and g.get("failure") == "rejection"
+                    and g["guard_if_line"] != contained["guard_if_line"]
+                    and len(g.get("guard_parent") or ()) <= len(write_parent)
+                    and tuple(write_parent[:len(g.get("guard_parent") or ())])
+                    == tuple(g.get("guard_parent") or ())
+                ]
                 transitions.append({
                     **_base(path, status_line),
                     "kind": "transition",
@@ -798,6 +998,12 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                     "guard_if_line": contained["guard_if_line"],
                     "enforcement_lines": [contained["guard_if_line"]],
                     "span": {"start_line": status_line, "end_line": status_line},
+                    "prerequisites": prerequisites,
+                    "coverage": (
+                        "contained-with-prerequisites"
+                        if prerequisites
+                        else "contained"
+                    ),
                 })
                 continue
             prior = [
@@ -810,6 +1016,20 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                 and g.get("guard_parent") == write_parent
             ]
             best = max(prior, key=lambda g: g["guard_if_line"]) if prior else None
+            other_prerequisites = [
+                {
+                    "guard": g["guard"],
+                    "guard_if_line": g["guard_if_line"],
+                    "enforcement_lines": list(g["enforcement_lines"]),
+                }
+                for g in body_guards
+                if g["guard_if_line"] < status_line
+                and g.get("failure") == "rejection"
+                and (best is None or g["guard_if_line"] != best["guard_if_line"])
+                and len(g.get("guard_parent") or ()) <= len(write_parent)
+                and tuple(write_parent[:len(g.get("guard_parent") or ())])
+                == tuple(g.get("guard_parent") or ())
+            ]
             transitions.append({
                 **_base(path, status_line),
                 "kind": "transition",
@@ -818,6 +1038,12 @@ def extract_guards(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                 "guard_if_line": best["guard_if_line"] if best is not None else None,
                 "enforcement_lines": list(best["enforcement_lines"]) if best is not None else [],
                 "span": {"start_line": status_line, "end_line": status_line},
+                "prerequisites": other_prerequisites if best is not None else [],
+                "coverage": (
+                    "prior-partial"
+                    if best is not None
+                    else "none"
+                ),
             })
     return enforced, transitions
 
@@ -826,18 +1052,30 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
     """Contract links between a client URL and OpenAPI paths.
 
     Compatible only when the client URL path matches an OpenAPI path *and*
-    the client method matches the OpenAPI operation method (the client
-    method rides on the URL record, or is inferred trivially from
-    ``postForObject``/``getForObject``/``exchange`` call sites via a
-    supported ``RestTemplate`` receiver; unknown
-    method abstains via ``candidate-needs-method``). An unused URL whose
+    the client method matches the OpenAPI operation method *and* invocation
+    evidence exists (a supported ``RestTemplate`` call line in the same
+    method; the client method rides on the URL record, or is inferred
+    trivially from ``postForObject``/``getForObject``/``exchange`` call
+    sites via a supported ``RestTemplate`` receiver; unknown
+    method abstains via ``candidate-needs-method``). Explicit-method-only
+    records without a call line yield a candidate (compatible False) with
+    a ``no-invocation`` reason -- compatible True honestly requires
+    invocation evidence. An unused URL whose
     path matches nothing yields no links. Duplicate destinations
     (same path+method in >1 operation) never yield compatible True
     (ambiguous destination: abstain/candidate). Equivalent is never true (client
-    URL carries scheme+host, OpenAPI path is path-only).
+    URL carries scheme+host, OpenAPI path is path-only). A compatible link is
+    an operation match only (path+method): delivery/schema/equivalence are
+    never verified, so every link carries ``destination_verified`` False with
+    ``destination_evidence`` holding the client hostname, and the reason
+    states the operation-only scope.
     """
     links: list[dict[str, Any]] = []
     client_path = urlparse(url_record["url"]).path
+    try:
+        client_host = urlparse(url_record["url"]).hostname
+    except ValueError:
+        client_host = None
     explicit = url_record.get("method")
     inferred_method, call_line = _infer_client_method_and_line(url_record)
     if explicit is not None and str(explicit).strip() != "":
@@ -870,6 +1108,8 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
         "client_path": client_path,
         "compatible": False,
         "equivalent": False,
+        "destination_verified": False,
+        "destination_evidence": client_host,
         "client_call_line": call_line,
         "client_call": call_text,
         "span": {
@@ -894,46 +1134,49 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
         )
         link["path_match"] = path_match
         link["method_match"] = method_match
-        link["compatible"] = bool(path_match and method_match)
+        link["compatible"] = bool(path_match and method_match and call_line is not None)
         link["equivalent"] = False
         never_equiv = "equivalent never true (client URL carries scheme+host, OpenAPI path is path-only)"
+        op_only = (
+            "operation-only match (path+method), not delivery/schema/equivalence; "
+            f"destination host {client_host!r} unverified (destination_verified false)"
+        )
         if dup_count > 1 and path_match and method_match:
             link["compatible"] = False
             link["reason"] = (
                 f"ambiguous destination: {dup_count} operations share path {client_path} "
                 f"and method {client_method}; abstain, no verified compatible link "
-                f"(candidate, duplicate destination); {never_equiv}"
+                f"(candidate, duplicate destination); {never_equiv}; {op_only}"
             )
         elif link["compatible"]:
             op_path_line = op.get("span", {}).get("start_line", op["line"]) if isinstance(op.get("span"), dict) else op["line"]
             binding_line = url_record["line"]
-            if call_line is not None:
-                link["reason"] = (
-                    f"compatible contract: client path {client_path} == openapi path {op['openapi_path']} "
-                    f"and method {client_method} == {op_method_norm}; "
-                    f"binding L{binding_line} + call L{call_line} + openapi path L{op_path_line} + method L{op['line']}; {never_equiv}"
-                )
-            else:
-                link["reason"] = (
-                    f"compatible contract: client path {client_path} == openapi path {op['openapi_path']} "
-                    f"and method {client_method} == {op_method_norm}; "
-                    f"binding L{binding_line} + openapi path L{op_path_line} + method L{op['line']}; {never_equiv}"
-                )
+            link["reason"] = (
+                f"compatible contract: client path {client_path} == openapi path {op['openapi_path']} "
+                f"and method {client_method} == {op_method_norm}; "
+                f"binding L{binding_line} + call L{call_line} + openapi path L{op_path_line} + method L{op['line']}; {never_equiv}; {op_only}"
+            )
         elif path_match:
-            if client_method is None or op_method_norm is None:
+            if method_match:
+                link["reason"] = (
+                    f"candidate-no-invocation: path {client_path} matches and method {client_method} == {op_method_norm} "
+                    f"but no invocation evidence (no-invocation, compatible requires call line); "
+                    f"(candidate, explicit-only without call); {never_equiv}; {op_only}"
+                )
+            elif client_method is None or op_method_norm is None:
                 link["reason"] = (
                     f"candidate-needs-method: path {client_path} matches but method is unknown "
-                    f"(client {client_method!r} vs openapi {op_method_norm!r}); {never_equiv}"
+                    f"(client {client_method!r} vs openapi {op_method_norm!r}); {never_equiv}; {op_only}"
                 )
             else:
                 link["reason"] = (
                     f"incompatible contract: method mismatch client {client_method} != openapi "
-                    f"{op_method_norm} for path {client_path}; {never_equiv}"
+                    f"{op_method_norm} for path {client_path}; {never_equiv}; {op_only}"
                 )
         else:
             link["reason"] = (
                 f"incompatible contract: client path {client_path} != openapi path {op['openapi_path']}; "
-                f"{never_equiv}"
+                f"{never_equiv}; {op_only}"
             )
         links.append(link)
     return links
