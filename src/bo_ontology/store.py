@@ -22,7 +22,7 @@ from typing import Any
 from bo_store.provenance import redact_value
 
 from . import schema
-from .migration import apply_migrations
+from .migration import MIGRATIONS_DIR, apply_migrations
 
 _TABLE = {
     "BusinessConcept": "concepts",
@@ -154,6 +154,7 @@ class OntologyStore:
         self.conn = sqlite3.connect(str(db)) if self._owns else db
         self.conn.row_factory = sqlite3.Row
         apply_migrations(self.conn)
+        self._ensure_dependencies()
 
     def __enter__(self) -> "OntologyStore":
         return self
@@ -166,6 +167,13 @@ class OntologyStore:
             self.conn.close()
 
     # ------------------------------------------------------------ internals
+
+    def _ensure_dependencies(self) -> None:
+        """Apply the dependencies-edge table (same mechanism as migrations)."""
+        path = MIGRATIONS_DIR / "0002_dependencies.sql"
+        if path.is_file():
+            self.conn.executescript(path.read_text(encoding="utf-8"))
+            self.conn.commit()
 
     @staticmethod
     def _table_for(kind: str) -> str:
@@ -311,8 +319,11 @@ class OntologyStore:
             raise ValueError(
                 f"kind {kind!r} has no value column; new_value cannot be stored"
             )
-        # Reuse the validated status path (audits a "status" entry).
-        self.update_status(kind, record_id, "stale")
+        # Reuse the validated status path (audits a "status" entry) where the
+        # table carries a status column (params/evidence have none: keep the
+        # invalidate audit + value update, skip the status flip).
+        if "status" in _COLUMNS[table]:
+            self.update_status(kind, record_id, "stale")
         if new_value is not _ABSENT:
             self.conn.execute(
                 f"UPDATE {table} SET {value_key} = ? WHERE id = ?",
@@ -330,8 +341,13 @@ class OntologyStore:
         updated = self.get(kind, record_id)
         assert updated is not None
         result = dict(updated)
-        result["status"] = schema.Status.STALE.value
-        result["superseded"] = True
+        # Status-less tables (params/evidence) carry no status column: do not
+        # fabricate in-memory ``status``/``superseded`` keys that a fresh
+        # read could never return (idempotence for these rows is decided via
+        # audit history instead).
+        if "status" in _COLUMNS[table]:
+            result["status"] = schema.Status.STALE.value
+            result["superseded"] = True
         result["invalidation_reason"] = (
             reason or "Artifact changed out-of-band (invalidated)"
         )
@@ -340,6 +356,170 @@ class OntologyStore:
         if value_key == "object":
             result["value"] = result.get("object")
         return result
+
+    @staticmethod
+    def _coerce_id(value: Any) -> Any:
+        """Restore integer primary keys stored in the TEXT edge columns."""
+        if isinstance(value, str) and value.lstrip("-").isdigit():
+            try:
+                return int(value)
+            except ValueError:
+                pass
+        return value
+
+    def add_dependency(
+        self,
+        src_kind: str,
+        src_id: Any,
+        dst_kind: str,
+        dst_id: Any,
+        reason: str | None = None,
+    ) -> Any:
+        """Link two existing records; no name-similarity guessing.
+
+        Both endpoints must already exist (``KeyError`` otherwise) and the
+        edge must be new (duplicate edges raise ``ValueError``). Unknown
+        kinds raise ``ValueError`` via ``_table_for``.
+        """
+        src_table = self._table_for(src_kind)
+        dst_table = self._table_for(dst_kind)
+        if src_table == "reviews" or dst_table == "reviews":
+            raise ValueError(
+                "reviews rows are audit history and cannot take part in "
+                "dependency edges"
+            )
+        reason = redact_value(reason)
+        if self.get(src_table, src_id) is None:
+            raise KeyError(f"unknown {src_table} record: {src_id!r}")
+        if self.get(dst_table, dst_id) is None:
+            raise KeyError(f"unknown {dst_table} record: {dst_id!r}")
+        exists = self.conn.execute(
+            "SELECT id FROM dependencies WHERE src_kind = ? AND src_id = ?"
+            " AND dst_kind = ? AND dst_id = ?",
+            (src_table, str(src_id), dst_table, str(dst_id)),
+        ).fetchone()
+        if exists is not None:
+            raise ValueError(
+                f"duplicate dependency: {src_table}:{src_id} -> "
+                f"{dst_table}:{dst_id}"
+            )
+        try:
+            cursor = self.conn.execute(
+                "INSERT INTO dependencies (src_kind, src_id, dst_kind, dst_id,"
+                " reason) VALUES (?, ?, ?, ?, ?)",
+                (src_table, str(src_id), dst_table, str(dst_id), reason),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                f"duplicate dependency: {src_table}:{src_id} -> "
+                f"{dst_table}:{dst_id}"
+            ) from exc
+        edge_id = cursor.lastrowid
+        self._audit(
+            "dependencies",
+            edge_id,
+            "link",
+            {
+                "src_kind": src_table,
+                "src_id": str(src_id),
+                "dst_kind": dst_table,
+                "dst_id": str(dst_id),
+                "reason": reason,
+            },
+        )
+        self.conn.commit()
+        return edge_id
+
+    def direct_dependents(self, kind: str, record_id: Any) -> list[dict]:
+        """Return explicit ``(dst_kind, dst_id, reason)`` edges, by edge id."""
+        table = self._table_for(kind)
+        rows = self.conn.execute(
+            "SELECT dst_kind, dst_id, reason FROM dependencies"
+            " WHERE src_kind = ? AND src_id = ? ORDER BY id",
+            (table, str(record_id)),
+        ).fetchall()
+        return [
+            {
+                "dst_kind": row["dst_kind"],
+                "dst_id": self._coerce_id(row["dst_id"]),
+                "reason": row["reason"],
+            }
+            for row in rows
+        ]
+
+    def _already_invalidated(self, table: str, record_id: Any) -> bool:
+        """True when an ``invalidate`` audit entry already covers a record.
+
+        Status-less tables (params/evidence) have no status column, so the
+        ``status == "stale"`` check can never fire for them; history is the
+        idempotence signal there.
+        """
+        return any(
+            entry.get("action") == "invalidate"
+            for entry in self.history(table, record_id)
+        )
+
+    def _is_stale_row(
+        self, table: str, row: dict | None, record_id: Any
+    ) -> bool:
+        """True when a cascade should traverse but not re-audit a record."""
+        if row is None:
+            return True
+        if row.get("status") == "stale":
+            return True
+        return "status" not in _COLUMNS.get(
+            table, ()
+        ) and self._already_invalidated(table, record_id)
+
+    def invalidate_cascade(
+        self,
+        kind: str,
+        record_id: Any,
+        reason: str | None = None,
+        new_value: Any = _ABSENT,
+    ) -> list[tuple]:
+        """Invalidate a record and its explicit dependents, breadth-first.
+
+        The root goes through ``self.invalidate`` (with ``new_value`` when
+        supplied); each dependent goes through ``self.invalidate`` with a
+        trigger reason chaining root -> parent plus the original reason, and
+        never receives ``new_value``. Already-stale records — the root
+        included — are traversed but not re-audited (status-less rows carry
+        no status flag, so a prior ``invalidate`` history entry is the
+        idempotence signal there), so diamonds/cycles/self-loops and repeat
+        cascades yield one ``invalidate`` entry per record. Returns
+        invalidated ``(kind, id)`` pairs in BFS order. The ``reviews`` table
+        is never touched.
+        """
+        root_table = self._table_for(kind)
+        root_id = self._coerce_id(record_id)
+        root_row = self.get(root_table, root_id)
+        if root_row is None:
+            raise KeyError(f"unknown {root_table} record: {record_id!r}")
+        visited = {(root_table, str(record_id))}
+        invalidated: list[tuple] = []
+        queue: list[tuple] = [(root_table, root_id)]
+        if not self._is_stale_row(root_table, root_row, root_id):
+            self.invalidate(kind, record_id, reason, new_value)
+            invalidated.append((root_table, root_id))
+        while queue:
+            cur_kind, cur_id = queue.pop(0)
+            trigger = f"cascade from {root_table}:{record_id} via {cur_kind}:{cur_id}"
+            if reason:
+                trigger += f": {reason}"
+            for edge in self.direct_dependents(cur_kind, cur_id):
+                dst_kind, dst_id = edge["dst_kind"], edge["dst_id"]
+                key = (dst_kind, str(dst_id))
+                if key in visited:
+                    continue
+                visited.add(key)
+                queue.append((dst_kind, dst_id))
+                row = self.get(dst_kind, dst_id)
+                if self._is_stale_row(dst_kind, row, dst_id):
+                    continue
+                self.invalidate(dst_kind, dst_id, trigger)
+                invalidated.append((dst_kind, dst_id))
+        return invalidated
 
     def delete(self, kind: str, record_id: Any) -> bool:
         """Delete one record and append the deletion to the audit history."""
