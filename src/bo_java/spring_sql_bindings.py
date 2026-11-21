@@ -106,6 +106,9 @@ _REST_TEMPLATE_DECL = re.compile(r"\bRestTemplate\s+([A-Za-z_][\w]*)")
 _CALL_METHOD_HINTS = (
     ("postForObject", "post"),
     ("getForObject", "get"),
+    ("put", "put"),
+    ("delete", "delete"),
+    ("patchForObject", "patch"),
 )
 _URL_VAR = re.compile(r'\b([A-Za-z_][\w]*)\s*=\s*["\']https?://')
 _HTTP_METHOD = re.compile(r"HttpMethod\.([A-Za-z]+)")
@@ -149,14 +152,16 @@ def _infer_client_method_and_line(
     """Method plus invocation line for a client-URL record.
 
     The variable must reach a supported call (postForObject/
-    getForObject/exchange+HttpMethod, ...) in the same method
-    (data-flow by name); otherwise (None, None) or (None, call line)
-    for unknown-method candidates (never compatible True).
+    getForObject/put/delete/patchForObject/exchange+HttpMethod, ...)
+    in the same method (data-flow by name); otherwise (None, None) or
+    (None, call line) for unknown-method candidates (never compatible
+    True).
 
     Hardening: the call receiver must be a supported ``RestTemplate``
     receiver -- a variable typed ``RestTemplate`` in the same file or
     the conventional field ``restTemplate`` (so ``<recv>.postForObject``/
-    ``<recv>.getForObject``/``<recv>.exchange`` only counts when
+    ``<recv>.getForObject``/``<recv>.put``/``<recv>.delete``/
+    ``<recv>.patchForObject``/``<recv>.exchange`` only counts when
     ``recv`` is allowlisted). Unsupported receivers (e.g. a custom
     ``FakeSender.postForObject``) never yield a method (abstain).
     """
@@ -231,8 +236,9 @@ def _infer_client_method(url_record: dict[str, Any]) -> str | None:
 
     Returns the HTTP method when the recorded URL (literal or its assigned
     variable) visibly reaches a ``RestTemplate`` request call
-    (``postForObject``/``getForObject``/``exchange`` with an explicit
-    ``HttpMethod``, ...); otherwise None (abstain: unknown method).
+    (``postForObject``/``getForObject``/``put``/``delete``/
+    ``patchForObject``/``exchange`` with an explicit ``HttpMethod``,
+    ...); otherwise None (abstain: unknown method).
     """
     method, _ = _infer_client_method_and_line(url_record)
     return method
@@ -279,6 +285,533 @@ def extract_annotations(path: Path) -> list[dict[str, Any]]:
         records.append(record)
     return records
 
+
+# ---------------------------------------------------------------- mapping routes
+# (Spring @RequestMapping class/method join; OpenAPI-absent linking)
+
+
+_MAPPING_VERB_BY_PREFIX = {
+    "Get": "get",
+    "Post": "post",
+    "Put": "put",
+    "Delete": "delete",
+    "Patch": "patch",
+}
+_REQUESTMETHOD_VERB = {
+    "GET": "get",
+    "POST": "post",
+    "PUT": "put",
+    "DELETE": "delete",
+    "PATCH": "patch",
+    "OPTIONS": "options",
+    "HEAD": "head",
+}
+_MAPPING_SHORT_NAMES = frozenset({
+    "GetMapping", "PostMapping", "PutMapping", "DeleteMapping",
+    "PatchMapping", "RequestMapping",
+})
+
+
+def _mapping_args_text(line: str) -> str:
+    """Annotation argument text (``(...)``) on a mapping line, else ``""``."""
+    pos = line.find("(")
+    if pos == -1:
+        return ""
+    text = line[pos:].strip()
+    if text.endswith("{"):
+        text = text[:-1].rstrip()
+    return text
+
+
+def _mapping_paths_from_args(args_text: str) -> tuple:
+    """Path literals from mapping args; dynamic/non-literal abstains.
+
+    Returns ``(paths, dynamic, reason)`` where ``paths`` is a list of
+    literals (``[]`` means no path declared: inherit the class base),
+    ``dynamic`` True means non-literal (concatenation, variable, no
+    quotes) with ``paths`` None and a reason (never fabricated).
+    Only ``value=``/``path=`` (or positional) literals count; other
+    params (``produces=``/``consumes=``) are ignored.
+    """
+    text = (args_text or "").strip()
+    if not text.startswith("("):
+        return [], False, None
+    inner = text[1:]
+    if inner.endswith(")"):
+        inner = inner[:-1]
+    if inner.strip() == "":
+        return [], False, None
+    if "+" in inner:
+        return None, True, (
+            "dynamic: concatenation in mapping args (abstain, no path claimed)"
+        )
+    array = re.search(r"(?:value|path)\s*=\s*\{([^}]*)\}", inner)
+    if array is not None:
+        literals = re.findall(r'"([^"]*)"', array.group(1))
+        if literals:
+            return literals, False, None
+        return None, True, (
+            "dynamic: non-literal value/path array (abstain, no path claimed)"
+        )
+    single = re.search(r'(?:value|path)\s*=\s*"([^"]*)"', inner)
+    if single is not None:
+        return [single.group(1)], False, None
+    stripped = inner.strip()
+    if stripped.startswith("{"):
+        head = stripped.split("}", 1)[0] + "}"
+        literals = re.findall(r'"([^"]*)"', head)
+        if literals:
+            return literals, False, None
+        return None, True, (
+            "dynamic: non-literal positional array (abstain, no path claimed)"
+        )
+    if stripped.startswith('"'):
+        first = re.match(r'\s*"([^"]*)"', stripped)
+        if first is not None:
+            return [first.group(1)], False, None
+    return None, True, (
+        "dynamic: non-literal mapping path (abstain, no path claimed)"
+    )
+
+
+def _requestmethods_from_args(args_text: str) -> tuple:
+    """HTTP methods from ``@RequestMapping(method=...)``.
+
+    Single ``RequestMethod.X`` yields ``([verb], False)``; an array or
+    absent method yields ``(None, True)`` (honest: never fabricated).
+    """
+    text = args_text or ""
+    array = re.search(r"method\s*=\s*\{([^}]*)\}", text)
+    if array is not None:
+        return None, True
+    single = re.search(r"method\s*=\s*RequestMethod\.([A-Za-z]+)", text)
+    if single is not None:
+        verb = single.group(1).strip().upper()
+        return [_REQUESTMETHOD_VERB.get(verb, verb.lower())], False
+    return None, True
+
+
+def _join_mapping_paths(class_base: str | None, method_path: str | None) -> str:
+    """Join class + method paths with a single ``/`` (``{var}`` kept)."""
+    base = (class_base or "").strip()
+    sub = (method_path or "").strip()
+    if base and sub:
+        joined = base.rstrip("/") + "/" + sub.lstrip("/")
+    else:
+        joined = base or sub
+    joined = re.sub(r"/{2,}", "/", joined)
+    if joined and not joined.startswith("/"):
+        joined = "/" + joined
+    return joined
+
+
+def _annotation_path_match(pattern: str | None, actual: str | None) -> bool:
+    """Path equality with ``{var}`` template segments (one segment each)."""
+    if not pattern or not actual:
+        return False
+    if pattern == actual:
+        return True
+    expected = pattern.split("/")
+    seen = actual.split("/")
+    if len(expected) != len(seen):
+        return False
+    for want, got in zip(expected, seen):
+        if len(want) >= 2 and want.startswith("{") and want.endswith("}"):
+            if not got:
+                return False
+            continue
+        if want != got:
+            return False
+    return True
+
+
+_MAPPING_METHOD_DECL = re.compile(
+    r"^\s*(?:(?:public|private|protected|static|final|synchronized|abstract|native|default)\s+)*"
+    r"[\w<>\[\]\?,\s\.@]+\s+([A-Za-z_][\w]*)\s*\("
+)
+_MAPPING_NON_METHOD = re.compile(
+    r"^(?:if|for|while|switch|catch|synchronized|new|return)\b"
+)
+
+
+def extract_mapping_routes(path: Path) -> list[dict[str, Any]]:
+    """Class+method Spring mapping routes with spans (stdlib only).
+
+    Each method-level ``@Get/Post/Put/Delete/PatchMapping`` (single
+    verb) or ``@RequestMapping`` (explicit single ``method=`` yields
+    that verb; array/absent yields ``http_methods`` None with
+    ``verb_unknown`` True, never fabricated) joins its literal path
+    (``value=``/``path=`` or positional; ``{var}`` kept) onto the
+    enclosing class ``@RequestMapping`` base (single literal; multiple
+    literals expand to one record each). Dynamic/non-literal paths
+    (concatenation, bare identifiers) abstain with ``path`` None plus
+    a reason. Every record carries ``source`` ``spring_annotation``.
+
+    NOTE (documented limitations, not fixes): a class-level ``method=``
+    constraint is ignored (a bare method-level ``@RequestMapping``
+    without its own ``method=`` still abstains as verb-unknown even
+    when the class base declares one); only a class-level
+    ``@RequestMapping`` counts as a base (a class-level ``@GetMapping``
+    or other shortcut is ignored, base ``""``); multi-line annotations
+    abstain by design (args must be on the annotation line: a wrapped
+    ``(...)`` yields no path literal, never half-parsed); an annotation
+    sharing the declaration line (``@GetMapping("/x") public ...``)
+    is not picked up (annotations are read from the consecutive lines
+    directly above the declaration only).
+    """
+    records: list[dict[str, Any]] = []
+    file = Path(path)
+    try:
+        lines = file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return []
+    try:
+        decls = _class_decls(file)
+    except (OSError, UnicodeError):
+        decls = []
+
+    def _class_bases(decl_line: int) -> tuple[list, dict | None]:
+        block = _preceding_annotations(lines, decl_line)
+        target = None
+        for entry in block:
+            if entry[1].split(".")[-1] == "RequestMapping":
+                target = entry
+        if target is None:
+            return [""], None
+        anno_line, _, args = target
+        paths, dynamic, reason = _mapping_paths_from_args(args)
+        info: dict[str, Any] = {
+            "annotation": "RequestMapping",
+            "line": anno_line,
+            "span": {"start_line": anno_line, "end_line": anno_line},
+            "args": args,
+        }
+        if dynamic:
+            return [None], info
+        if not paths:
+            return [""], info
+        return list(paths), info
+
+    class_infos: list[dict[str, Any]] = []
+    for decl in decls:
+        bases, anno = _class_bases(int(decl["line"]))
+        class_infos.append({
+            "class": decl["class"],
+            "line": int(decl["line"]),
+            "bases": bases,
+            "annotation": anno,
+        })
+
+    def _owner(decl_line: int) -> dict[str, Any]:
+        current: dict[str, Any] = {"class": None, "bases": [""], "annotation": None}
+        for info in class_infos:
+            if info["line"] < decl_line:
+                current = info
+            else:
+                break
+        return current
+
+    for decl_line, decl_text in enumerate(lines, start=1):
+        decl_match = _MAPPING_METHOD_DECL.match(decl_text)
+        if not decl_match:
+            continue
+        stripped = decl_text.strip()
+        if stripped.startswith("@"):
+            continue
+        if _MAPPING_NON_METHOD.match(stripped):
+            continue
+        if re.search(r"\b(class|interface|enum)\b", decl_text):
+            continue
+        if decl_text.count("(") != decl_text.count(")"):
+            continue
+        body = {"name": decl_match.group(1), "decl": decl_line}
+        owner = _owner(decl_line)
+        block = _preceding_annotations(lines, decl_line)
+        for anno_line, name, args in block:
+            short = name.split(".")[-1]
+            if short not in _MAPPING_SHORT_NAMES:
+                continue
+            if short == "RequestMapping":
+                methods, unknown = _requestmethods_from_args(args)
+            else:
+                prefix = short.replace("Mapping", "")
+                methods = [_MAPPING_VERB_BY_PREFIX[prefix]]
+                unknown = False
+            method_paths, dynamic, reason = _mapping_paths_from_args(args)
+            if dynamic:
+                candidates: list = [None]
+            elif not method_paths:
+                candidates = [""]
+            else:
+                candidates = list(method_paths)
+            for base in owner["bases"]:
+                for sub in candidates:
+                    if dynamic or base is None or sub is None:
+                        joined = None
+                        why = reason or (
+                            "dynamic: non-literal class or method path "
+                            "(abstain, no path claimed)"
+                        )
+                    else:
+                        joined = _join_mapping_paths(str(base), str(sub))
+                        why = None
+                        if unknown:
+                            why = (
+                                "verb unknown: @RequestMapping without a "
+                                "single method (abstain, never compatible True)"
+                            )
+                    record = dict(_base(file, anno_line))
+                    record.update({
+                        "kind": "mapping_route",
+                        "class": owner["class"],
+                        "method": body["name"],
+                        "http_methods": list(methods) if methods is not None else None,
+                        "verb_unknown": bool(unknown),
+                        "path": joined,
+                        "source": "spring_annotation",
+                        "class_annotation": owner["annotation"],
+                        "method_annotation": {
+                            "annotation": short,
+                            "line": anno_line,
+                            "span": {"start_line": anno_line, "end_line": anno_line},
+                            "args": args,
+                        },
+                        "reason": why,
+                        "span": {"start_line": anno_line, "end_line": decl_line},
+                    })
+                    records.append(record)
+    return records
+
+
+def emit_annotation_operations(mapping_routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Annotation-backed operations (OpenAPI-absent linking source).
+
+    Routes with a single known verb plus a literal path become
+    ``linkable`` operations reusing the ``openapi_path`` key (plus
+    ``source`` ``spring_annotation`` and ``operation_id`` None) so
+    link code can reuse path logic; verb-unknown or path-None routes
+    yield ``linkable`` False with an unresolved reason (never
+    compatible True).
+    """
+    operations: list[dict[str, Any]] = []
+    for route in mapping_routes or []:
+        if not isinstance(route, dict) or route.get("kind") != "mapping_route":
+            continue
+        try:
+            file = Path(str(route.get("file", "")))
+            line = int(route.get("line", 1))
+        except (ValueError, TypeError):
+            continue
+        try:
+            record = dict(_base(file, line))
+        except (OSError, UnicodeError):
+            record = {
+                "origin": ORIGIN,
+                "extractor_version": EXTRACTOR_VERSION,
+                "file": str(route.get("file", "")),
+                "line": line,
+                "content_hash": str(route.get("content_hash", "")),
+            }
+        methods = route.get("http_methods")
+        route_path = route.get("path")
+        single = isinstance(methods, list) and len(methods) == 1
+        known_path = isinstance(route_path, str) and route_path != ""
+        linkable = bool(single and known_path)
+        if linkable:
+            reason = None
+        elif not known_path:
+            reason = (
+                "unresolved: dynamic/non-literal annotation path "
+                "(abstain, never compatible True)"
+            )
+        else:
+            reason = (
+                "unresolved: annotation route without a single HTTP method "
+                "(abstain, never compatible True)"
+            )
+        record.update({
+            "kind": "annotation_operation",
+            "openapi_path": route_path if isinstance(route_path, str) else None,
+            "method": methods[0] if single else None,
+            "operation_id": None,
+            "operation_id_line": None,
+            "responses": [],
+            "responses_span": None,
+            "source": "spring_annotation",
+            "linkable": linkable,
+            "verb_unknown": bool(route.get("verb_unknown", not single)),
+            "handler_class": route.get("class"),
+            "handler_method": route.get("method"),
+            "mapping_span": route.get("span"),
+            "reason": reason,
+            "span": route.get("span") or {"start_line": line, "end_line": line},
+        })
+        operations.append(record)
+    return operations
+
+
+def link_client_to_annotation(
+    url_record: dict[str, Any],
+    annotation_ops: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Declared-only links between a client URL and annotation operations.
+
+    Compatible only when the client path matches the annotation path
+    (equality or ``{var}`` template) *and* the client method matches
+    the operation verb *and* invocation evidence exists (a supported
+    ``RestTemplate`` call line in the same method) *and* the route is
+    unambiguous (a single operation for path+method; duplicates
+    abstain as ambiguous). ``destination_verified`` stays False and
+    ``equivalent`` never True (operation-only match, path-only
+    operation). Unmatched URLs yield no links.
+    """
+    links: list[dict[str, Any]] = []
+    try:
+        client_path = urlparse(url_record["url"]).path
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return []
+    if not client_path:
+        return []
+    try:
+        client_host = urlparse(url_record["url"]).hostname
+    except ValueError:
+        client_host = None
+    ops = [op for op in annotation_ops or [] if isinstance(op, dict)]
+    if not any(
+        isinstance(op.get("openapi_path"), str)
+        and _annotation_path_match(str(op.get("openapi_path")), client_path)
+        for op in ops
+    ):
+        return []
+    explicit = url_record.get("method")
+    inferred_method, call_line = _infer_client_method_and_line(url_record)
+    if explicit is not None and str(explicit).strip() != "":
+        client_method: str | None = str(explicit).strip().lower()
+    else:
+        client_method = inferred_method
+    call_text: str | None = None
+    if isinstance(call_line, int):
+        try:
+            call_text = Path(url_record["file"]).read_text(
+                encoding="utf-8"
+            ).splitlines()[call_line - 1].strip()
+        except (OSError, UnicodeError, IndexError, KeyError, TypeError):
+            call_text = None
+    dup_count = 0
+    if client_method is not None:
+        for op in ops:
+            norm = op.get("method")
+            norm = (
+                str(norm).strip().lower()
+                if norm is not None and str(norm).strip() != ""
+                else None
+            )
+            if (
+                isinstance(op.get("openapi_path"), str)
+                and _annotation_path_match(str(op.get("openapi_path")), client_path)
+                and norm == client_method
+                and op.get("linkable", True) is not False
+                and norm is not None
+            ):
+                dup_count += 1
+    base = {
+        **_base(Path(url_record["file"]), url_record["line"]),
+        "kind": "contract_link",
+        "client_url": url_record["url"],
+        "client_path": client_path,
+        "compatible": False,
+        "equivalent": False,
+        "destination_verified": False,
+        "destination_evidence": client_host,
+        "client_call_line": call_line,
+        "client_call": call_text,
+        "source": "spring_annotation",
+        "span": {
+            "start_line": url_record["line"],
+            "end_line": url_record["line"],
+        },
+    }
+    for op in ops:
+        link = dict(base)
+        op_path = op.get("openapi_path")
+        link["openapi_path"] = op_path
+        link["openapi_file"] = op.get("file")
+        link["openapi_line"] = op.get("line")
+        link["annotation_file"] = op.get("file")
+        link["annotation_line"] = op.get("line")
+        op_method = op.get("method")
+        op_norm = (
+            str(op_method).strip().lower()
+            if op_method is not None and str(op_method).strip() != ""
+            else None
+        )
+        path_match = (
+            isinstance(op_path, str)
+            and _annotation_path_match(op_path, client_path)
+        )
+        method_match = bool(
+            client_method and op_norm and client_method == op_norm
+        )
+        link["path_match"] = path_match
+        link["method_match"] = method_match
+        linkable = (
+            path_match is True
+            and op.get("linkable", True) is not False
+            and isinstance(op_path, str)
+            and op_norm is not None
+        )
+        link["compatible"] = bool(
+            path_match and method_match and call_line is not None
+            and linkable and dup_count <= 1
+        )
+        link["equivalent"] = False
+        never_equiv = "equivalent never true (client URL carries scheme+host, annotation path is path-only)"
+        op_only = (
+            "operation-only match (path+method), not delivery/schema/equivalence; "
+            f"destination host {client_host!r} unverified (destination_verified false); "
+            "source spring_annotation"
+        )
+        if dup_count > 1 and path_match and method_match:
+            link["compatible"] = False
+            link["reason"] = (
+                f"ambiguous destination: {dup_count} annotation operations share path "
+                f"{client_path} and method {client_method}; abstain, no verified "
+                f"compatible link (candidate, duplicate destination); {never_equiv}; {op_only}"
+            )
+        elif link["compatible"]:
+            op_line = op.get("span", {}).get("start_line", op["line"]) if isinstance(op.get("span"), dict) else op["line"]
+            link["reason"] = (
+                f"compatible contract (annotation-backed): client path {client_path} == "
+                f"annotation path {op_path} and method {client_method} == {op_norm}; "
+                f"binding L{url_record['line']} + call L{call_line} + annotation path "
+                f"L{op_line} + method L{op['line']}; {never_equiv}; {op_only}"
+            )
+        elif path_match:
+            if method_match:
+                link["reason"] = (
+                    f"candidate-no-invocation: path {client_path} matches annotation path "
+                    f"{op_path} and method {client_method} == {op_norm} but no invocation "
+                    f"evidence (no-invocation, compatible requires call line); "
+                    f"(candidate, explicit-only without call); {never_equiv}; {op_only}"
+                )
+            elif client_method is None or op_norm is None:
+                link["reason"] = (
+                    f"candidate-needs-method: path {client_path} matches annotation path "
+                    f"{op_path} but method is unknown (client {client_method!r} vs "
+                    f"annotation {op_norm!r}); {never_equiv}; {op_only}"
+                )
+            else:
+                link["reason"] = (
+                    f"incompatible contract: method mismatch client {client_method} != "
+                    f"annotation {op_norm} for path {client_path}; {never_equiv}; {op_only}"
+                )
+        else:
+            link["reason"] = (
+                f"incompatible contract: client path {client_path} != annotation path "
+                f"{op_path}; {never_equiv}; {op_only}"
+            )
+        links.append(link)
+    return links
 
 # ---------------------------------------------------------------- YAML policy
 
@@ -2668,6 +3201,7 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
     """Extract all bindings from the given repos; deterministic summary."""
     repos = [Path(p) for p in repo_paths]
     annotations: list[dict[str, Any]] = []
+    mapping_routes: list[dict[str, Any]] = []
     policies: list[dict[str, Any]] = []
     persistence: list[dict[str, Any]] = []
     openapi: list[dict[str, Any]] = []
@@ -2682,6 +3216,7 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
                 file = Path(root) / name
                 if name.endswith(".java"):
                     annotations.extend(extract_annotations(file))
+                    mapping_routes.extend(extract_mapping_routes(file))
                     client_urls.extend(extract_client_urls(file))
                     rules, trans = extract_guards(file)
                     enforced_rules.extend(rules)
@@ -2696,6 +3231,9 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
     contract_links: list[dict[str, Any]] = []
     for url_record in client_urls:
         contract_links.extend(link_client_url(url_record, openapi))
+    annotation_operations = emit_annotation_operations(mapping_routes)
+    for url_record in client_urls:
+        contract_links.extend(link_client_to_annotation(url_record, annotation_operations))
 
     return {
         "origin": ORIGIN,
@@ -2703,6 +3241,8 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
         "repos": [str(p) for p in repos],
         "records": {
             "annotations": annotations,
+            "mapping_routes": mapping_routes,
+            "annotation_operations": annotation_operations,
             "policies": policies,
             "persistence": persistence,
             "openapi": openapi,
@@ -2713,6 +3253,8 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
         },
         "counts": {
             "annotations": len(annotations),
+            "mapping_routes": len(mapping_routes),
+            "annotation_operations": len(annotation_operations),
             "policies": len(policies),
             "persistence": len(persistence),
             "openapi": len(openapi),
