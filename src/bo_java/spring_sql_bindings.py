@@ -20,7 +20,10 @@ Extracts binding evidence from fixture sources as plain text:
   ``operationId`` (when present) and its declared ``responses`` (status
   codes plus header names under ``responses:``, each with its line).
 * Bean Validation field constraints (``@NotNull``/``@NotEmpty``/
-  ``@NotBlank``/``@Size``/``@Digits``/``@Pattern``/``@Min``/``@Max`` with
+  ``@NotBlank``/``@Size``/``@Digits``/``@Pattern``/``@Min``/``@Max``/
+  ``@Email``/``@Positive``/``@PositiveOrZero``/``@Negative``/
+  ``@NegativeOrZero``/``@Past``/``@PastOrPresent``/``@Future``/
+  ``@FutureOrPresent``/``@DecimalMin``/``@DecimalMax`` with
   params) on field/getter declarations with
   annotation-to-declaration spans, plus record-component constraints
   (``record Name(...)`` inline annotations, same annotation set, as
@@ -397,26 +400,74 @@ def _mapping_paths_from_args(args_text: str) -> tuple:
     if stripped.startswith('"'):
         first = re.match(r'\s*"([^"]*)"', stripped)
         if first is not None:
+            # Positional multi without braces (e.g. @GetMapping("/x","/y"),
+            # invalid without {}) is ambiguous: abstain, never claim ["/x"].
+            if "," in stripped[first.end():]:
+                return None, True, (
+                    "dynamic: ambiguous positional multi without braces "
+                    "(abstain, no path claimed)"
+                )
             return [first.group(1)], False, None
     return None, True, (
         "dynamic: non-literal mapping path (abstain, no path claimed)"
     )
 
 
+def _parse_method_token(token: str) -> str | None:
+    """Single ``method=`` token to a lowercase verb, or None (abstain).
+
+    Accepts qualified ``RequestMethod.X`` and bare ``X`` (static import);
+    ``X`` must be one of the seven known verbs in uppercase
+    (GET/POST/PUT/DELETE/PATCH/OPTIONS/HEAD, case-sensitive: bare
+    lowercase ``get``/``post`` is a variable, abstain, never fabricated).
+    Anything else (``FOO``, ``someVar``, ``A | B``, quoted strings,
+    fully-qualified ``org.springframework...RequestMethod.GET``) returns
+    None: abstain, never fabricated (fully-qualified abstains by design,
+    documented, not fixed).
+    """
+    text = (token or "").strip()
+    match = re.match(r"^(?:RequestMethod\s*\.\s*)?([A-Za-z_][\w]*)$", text)
+    if not match:
+        return None
+    return _REQUESTMETHOD_VERB.get(match.group(1))
+
+
 def _requestmethods_from_args(args_text: str) -> tuple:
     """HTTP methods from ``@RequestMapping(method=...)``.
 
-    Single ``RequestMethod.X`` yields ``([verb], False)``; an array or
-    absent method yields ``(None, True)`` (honest: never fabricated).
+    Qualified ``RequestMethod.X`` and bare ``X`` (static import) both
+    resolve when ``X`` is a known verb (GET/POST/PUT/DELETE/PATCH/
+    OPTIONS/HEAD); single yields ``([verb], False)`` and an array
+    ``{A, B}`` (qualified, bare, or mixed) yields ``([a, b], False)``
+    in source order. Unrecognized/dynamic (``FOO``, ``someVar``,
+    ``A | B``, quoted, empty) or absent yields ``(None, True)``
+    (honest: never fabricated).
     """
     text = args_text or ""
     array = re.search(r"method\s*=\s*\{([^}]*)\}", text)
     if array is not None:
-        return None, True
-    single = re.search(r"method\s*=\s*RequestMethod\.([A-Za-z]+)", text)
+        parts = [part.strip() for part in array.group(1).split(",")]
+        parts = [part for part in parts if part != ""]
+        if not parts:
+            return None, True
+        verbs: list[str] = []
+        for part in parts:
+            verb = _parse_method_token(part)
+            if verb is None:
+                return None, True
+            verbs.append(verb)
+        return verbs, False
+    single = re.search(r"method\s*=\s*([^,\)\}]+)", text)
     if single is not None:
-        verb = single.group(1).strip().upper()
-        return [_REQUESTMETHOD_VERB.get(verb, verb.lower())], False
+        # Invalid Java missing braces (method=GET, POST captures GET only):
+        # a comma before ")" after the single token is ambiguous: abstain.
+        tail = text[single.end():]
+        if "," in tail.split(")", 1)[0]:
+            return None, True
+        verb = _parse_method_token(single.group(1))
+        if verb is None:
+            return None, True
+        return [verb], False
     return None, True
 
 
@@ -467,8 +518,9 @@ def extract_mapping_routes(path: Path) -> list[dict[str, Any]]:
     """Class+method Spring mapping routes with spans (stdlib only).
 
     Each method-level ``@Get/Post/Put/Delete/PatchMapping`` (single
-    verb) or ``@RequestMapping`` (explicit single ``method=`` yields
-    that verb; array/absent yields ``http_methods`` None with
+    verb) or ``@RequestMapping`` (explicit single or array ``method=``
+    of known verbs yields that verb list; unknown/dynamic/absent
+    yields ``http_methods`` None with
     ``verb_unknown`` True, never fabricated) joins its literal path
     (``value=``/``path=`` or positional; ``{var}`` kept) onto the
     enclosing class ``@RequestMapping`` base (single literal; multiple
@@ -621,6 +673,10 @@ def emit_annotation_operations(mapping_routes: list[dict[str, Any]]) -> list[dic
     link code can reuse path logic; verb-unknown or path-None routes
     yield ``linkable`` False with an unresolved reason (never
     compatible True).
+
+    NOTE (documented, not fixed): an empty ``path == ""`` (no path
+    declared, inherits empty base) shares the dynamic/non-literal
+    unresolved reason (no literal path claimed, never compatible True).
     """
     operations: list[dict[str, Any]] = []
     for route in mapping_routes or []:
@@ -1027,6 +1083,17 @@ _CONSTRAINT_ANNOTATIONS = {
     "Pattern",
     "Min",
     "Max",
+    "Email",
+    "Positive",
+    "PositiveOrZero",
+    "Negative",
+    "NegativeOrZero",
+    "Past",
+    "PastOrPresent",
+    "Future",
+    "FutureOrPresent",
+    "DecimalMin",
+    "DecimalMax",
 }
 _CLASS_DECL = re.compile(
     r"^\s*(?:(?:public|protected|private|abstract|final|sealed)\s+)*"
@@ -1371,7 +1438,11 @@ def _is_field_line(line: str) -> bool:
 def extract_field_constraints(path: Path) -> list[dict[str, Any]]:
     """Bean Validation constraints on field/getter declarations.
 
-    Each ``@NotNull``/``@NotEmpty``/``@NotBlank``/``@Size`` annotation in
+    Each ``@NotNull``/``@NotEmpty``/``@NotBlank``/``@Size``/``@Digits``/
+    ``@Pattern``/``@Min``/``@Max``/``@Email``/``@Positive``/
+    ``@PositiveOrZero``/``@Negative``/``@NegativeOrZero``/``@Past``/
+    ``@PastOrPresent``/``@Future``/``@FutureOrPresent``/``@DecimalMin``/
+    ``@DecimalMax`` annotation in
     the consecutive block directly above a field (or getter, recorded
     under its derived property name) becomes a ``field_constraint``
     record with params, annotation-to-declaration span, and
@@ -1409,7 +1480,12 @@ def extract_field_constraints(path: Path) -> list[dict[str, Any]]:
             getter_match = _GETTER_DECL.match(line)
             if getter_match:
                 suffix = getter_match.group(1)
-                field = suffix[0].lower() + suffix[1:] if suffix else None
+                # JavaBeans decap: getURL -> URL (second char uppercase keeps
+                # suffix), else lower first char (getLabel -> label).
+                if suffix and len(suffix) > 1 and suffix[1].isupper():
+                    field = suffix
+                else:
+                    field = suffix[0].lower() + suffix[1:] if suffix else None
         if not field:
             continue
         found = [
@@ -1522,7 +1598,10 @@ def extract_record_constraints(path: Path) -> list[dict[str, Any]]:
     Each ``record Name[<...}](...)`` header (single- or multi-line,
     balanced parens, same file, optional generic type-params) is
     scanned; every inline ``@X[(params)]`` on a component whose short
-    name is in ``_CONSTRAINT_ANNOTATIONS`` becomes a
+    name is in ``_CONSTRAINT_ANNOTATIONS`` (core ``@NotNull`` etc plus
+    ``@Email``/``@Positive``/``@PositiveOrZero``/``@Negative``/
+    ``@NegativeOrZero``/``@Past``/``@PastOrPresent``/``@Future``/
+    ``@FutureOrPresent``/``@DecimalMin``/``@DecimalMax``) becomes a
     ``record_component_constraint`` record (``record``/``class`` name,
     ``component``/``field`` name, annotation, params, annotation line,
     annotation-to-component span, plus the ``record_header`` span).
@@ -1781,13 +1860,17 @@ def resolve_inheritance(paths: list[Path | str]) -> list[dict[str, Any]]:
     ``class`` C, ``inherited: True``, ``parent_class`` P, and the parent
     span cited (evidence stays at the parent file/line). When P is absent,
     one ``inheritance_gap`` record (``resolved: False``) is emitted and no
-    inherited rules are fabricated.
+    inherited rules are fabricated. Simple-name duplicates (same class
+    name in different files, different packages) are ambiguous: no merge,
+    one ``inheritance_gap`` with ``resolved`` False (abstain, never merge
+    the wrong parent).
     """
     files = [Path(p) for p in paths]
     own: dict[str, list[dict[str, Any]]] = {}
     decl_file: dict[str, Path] = {}
     parents: dict[str, str | None] = {}
     decl_lines: dict[str, tuple[Path, int]] = {}
+    ambiguous: set[str] = set()
     order: list[str] = []
     for file in files:
         try:
@@ -1795,6 +1878,11 @@ def resolve_inheritance(paths: list[Path | str]) -> list[dict[str, Any]]:
         except (OSError, UnicodeError):
             continue
         for decl in decls:
+            if decl["class"] in decl_file and decl_file[decl["class"]] != file:
+                # Duplicate simple name in a different file: ambiguous, no
+                # merge (never pick the wrong parent by simple name).
+                ambiguous.add(decl["class"])
+                continue
             parents.setdefault(decl["class"], decl["superclass"])
             decl_lines.setdefault(decl["class"], (file, decl["line"]))
             if decl["class"] not in decl_file:
@@ -1814,8 +1902,11 @@ def resolve_inheritance(paths: list[Path | str]) -> list[dict[str, Any]]:
         if cls in seen:
             memo[cls] = []
             return []
+        if cls in ambiguous:
+            memo[cls] = []
+            return []
         parent = parents.get(cls)
-        if not parent or parent not in decl_file:
+        if not parent or parent not in decl_file or parent in ambiguous:
             memo[cls] = []
             return []
         merged: list[dict[str, Any]] = []
@@ -1839,6 +1930,23 @@ def resolve_inheritance(paths: list[Path | str]) -> list[dict[str, Any]]:
     for cls in order:
         parent = parents.get(cls)
         if not parent:
+            continue
+        if cls in ambiguous or parent in ambiguous:
+            file, line = decl_lines[cls]
+            gap = dict(_base(file, line))
+            gap.update({
+                "kind": "inheritance_gap",
+                "class": cls,
+                "superclass": parent,
+                "resolved": False,
+                "reason": (
+                    f"ambiguous: duplicate simple name for {parent!r} or "
+                    f"{cls!r} in different files (abstain, no inherited "
+                    "rules claimed)"
+                ),
+                "span": {"start_line": line, "end_line": line},
+            })
+            resolved.append(gap)
             continue
         if parent in decl_file:
             resolved.extend(_inherited(cls, frozenset()))
@@ -1939,10 +2047,14 @@ def has_valid_enforcement(path: Path) -> dict[str, Any]:
         signature = "\n".join(lines[body["decl"] - 1:body["base"] - 1])
         kinds: list[tuple[str, int]] = []
         # MED2: require @Valid/@Validated inside the param list (paren
-        # text), not the return position.
+        # text), not the return position. Strip strings/comments first so
+        # "@Valid" inside a literal (e.g. @RequestBody(" @Valid ")) never
+        # verifies (match link_record_enforcement).
         param_text = _signature_param_text(signature)
-        if param_text is not None and _VALID_PARAM.search(param_text):
-            kinds.append(("valid_param", body["decl"]))
+        if param_text is not None:
+            probe = _strip_string_literals(_strip_java_comments(param_text))
+            if _VALID_PARAM.search(probe):
+                kinds.append(("valid_param", body["decl"]))
         for offset, text in enumerate(body["lines"]):
             if _VALIDATOR_CALL.search(text):
                 kinds.append(("validator_call", body["base"] + offset))
@@ -2020,7 +2132,12 @@ def extract_jpa_entities(path: Path) -> list[dict[str, Any]]:
                 getter_match = _GETTER_DECL.match(fline)
                 if getter_match:
                     suffix = getter_match.group(1)
-                    field = suffix[0].lower() + suffix[1:] if suffix else None
+                    # JavaBeans decap: getURL -> URL (second char uppercase
+                    # keeps suffix), else lower first char.
+                    if suffix and len(suffix) > 1 and suffix[1].isupper():
+                        field = suffix
+                    else:
+                        field = suffix[0].lower() + suffix[1:] if suffix else None
             if not field:
                 continue
             fblock = _preceding_annotations(lines, findex)

@@ -570,7 +570,583 @@ def test_path_template_match_supported(tmp_path):
     assert all(link.get("source") == "spring_annotation" for link in links), links
 
 
+STATIC_IMPORT_SINGLE_CONTROLLER = """\
+package com.example.widgets;
+
+import static org.springframework.web.bind.annotation.RequestMethod.POST;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetStaticImportController {
+
+    @RequestMapping(path = "/static-post", method = POST)
+    public String staticPost() {
+        return "ok";
+    }
+}
+"""
+
+QUALIFIED_PUT_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetQualifiedPutController {
+
+    @RequestMapping(value = "/qualified-put", method = RequestMethod.PUT)
+    public String qualifiedPut() {
+        return "ok";
+    }
+}
+"""
+
+ARRAY_QUALIFIED_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetArrayQualifiedController {
+
+    @RequestMapping(value = "/multi-verb", method = {RequestMethod.GET, RequestMethod.POST})
+    public String multiVerb() {
+        return "ok";
+    }
+}
+"""
+
+ARRAY_BARE_CONTROLLER = """\
+package com.example.orders;
+
+import static org.springframework.web.bind.annotation.RequestMethod.POST;
+import static org.springframework.web.bind.annotation.RequestMethod.PUT;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class OrderArrayBareController {
+
+    @RequestMapping(value = "/bare-multi", method = {POST, PUT})
+    public String bareMulti() {
+        return "ok";
+    }
+}
+"""
+
+ARRAY_MIXED_CONTROLLER = """\
+package com.example.orders;
+
+import static org.springframework.web.bind.annotation.RequestMethod.POST;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class OrderArrayMixedController {
+
+    @RequestMapping(value = "/mixed-multi", method = {RequestMethod.GET, POST})
+    public String mixedMulti() {
+        return "ok";
+    }
+}
+"""
+
+HEAD_OPTIONS_CONTROLLER = """\
+package com.example.widgets;
+
+import static org.springframework.web.bind.annotation.RequestMethod.OPTIONS;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetHeadOptionsController {
+
+    @RequestMapping(value = "/head-route", method = RequestMethod.HEAD)
+    public String headRoute() {
+        return "ok";
+    }
+
+    @RequestMapping(value = "/options-route", method = OPTIONS)
+    public String optionsRoute() {
+        return "ok";
+    }
+}
+"""
+
+UNKNOWN_METHOD_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetUnknownMethodController {
+
+    @RequestMapping(value = "/mystery", method = FOO)
+    public String mystery() {
+        return "ok";
+    }
+}
+"""
+
+DYNAMIC_METHOD_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetDynamicMethodController {
+
+    @RequestMapping(value = "/dyn-verb", method = someVar)
+    public String dynVerb() {
+        return "ok";
+    }
+}
+"""
+
+BITWISE_METHOD_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetBitwiseMethodController {
+
+    @RequestMapping(value = "/bitwise", method = RequestMethod.GET | RequestMethod.POST)
+    public String bitwise() {
+        return "ok";
+    }
+}
+"""
+
+
+def test_static_import_single_resolves_post(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "WidgetStaticImportController.java", STATIC_IMPORT_SINGLE_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] == ["post"], routes
+    assert routes[0]["verb_unknown"] is False, routes
+    assert routes[0]["path"] == "/static-post", routes
+
+
+def test_qualified_single_put(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "WidgetQualifiedPutController.java", QUALIFIED_PUT_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] == ["put"], routes
+    assert routes[0]["verb_unknown"] is False, routes
+
+
+def test_array_qualified_get_post_order_preserved(tmp_path):
+    from bo_java.spring_sql_bindings import extract_client_urls
+
+    routes, _ = _routes_for(
+        tmp_path, "WidgetArrayQualifiedController.java", ARRAY_QUALIFIED_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] == ["get", "post"], routes
+    assert set(routes[0]["http_methods"]) == {"get", "post"}, routes
+    assert routes[0]["verb_unknown"] is False, routes
+    # 2-verb routes never link as single-method operations: abstain.
+    ops = emit_annotation_operations(routes)
+    assert len(ops) == 1 and ops[0].get("linkable") is False, ops
+    assert ops[0].get("method") is None, ops
+    client_src = _write(
+        tmp_path,
+        "MultiVerbClient.java",
+        "package com.example.widgets;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+        "public class MultiVerbClient {\n"
+        "    private final RestTemplate restTemplate = new RestTemplate();\n"
+        "    public String call() {\n"
+        '        String url = "http://widget-svc.local/multi-verb";\n'
+        "        return restTemplate.getForObject(url, String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    urls = extract_client_urls(client_src)
+    links = link_client_to_annotation(urls[0], ops)
+    assert links, links
+    assert all(link["compatible"] is False for link in links), links
+
+
+def test_array_bare_post_put(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "OrderArrayBareController.java", ARRAY_BARE_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert set(routes[0]["http_methods"] or []) == {"post", "put"}, routes
+    assert routes[0]["verb_unknown"] is False, routes
+
+
+def test_array_mixed_qualified_and_bare(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "OrderArrayMixedController.java", ARRAY_MIXED_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert set(routes[0]["http_methods"] or []) == {"get", "post"}, routes
+    assert routes[0]["verb_unknown"] is False, routes
+
+
+def test_head_options_single_verbs(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "WidgetHeadOptionsController.java", HEAD_OPTIONS_CONTROLLER
+    )
+    by_path = {r["path"]: r for r in routes}
+    assert by_path["/head-route"]["http_methods"] == ["head"], routes
+    assert by_path["/options-route"]["http_methods"] == ["options"], routes
+    assert all(r["verb_unknown"] is False for r in routes), routes
+
+
+def test_unknown_method_abstains(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "WidgetUnknownMethodController.java", UNKNOWN_METHOD_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] is None, routes
+    assert routes[0]["verb_unknown"] is True, routes
+
+
+def test_dynamic_method_var_abstains(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "WidgetDynamicMethodController.java", DYNAMIC_METHOD_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] is None, routes
+    assert routes[0]["verb_unknown"] is True, routes
+
+
+def test_bitwise_method_abstains(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "WidgetBitwiseMethodController.java", BITWISE_METHOD_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] is None, routes
+    assert routes[0]["verb_unknown"] is True, routes
+
+
+LOWERCASE_VAR_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetLowercaseVarController {
+
+    @RequestMapping(value = "/lower", method = get)
+    public String lower() {
+        return "ok";
+    }
+}
+"""
+
+
+SINGLE_COMMA_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetSingleCommaController {
+
+    @RequestMapping(value = "/comma", method = RequestMethod.GET, POST)
+    public String comma() {
+        return "ok";
+    }
+}
+"""
+
+
+POSITIONAL_MULTI_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetPositionalMultiController {
+
+    @GetMapping("/x","/y")
+    public String multi() {
+        return "ok";
+    }
+}
+"""
+
+
+QUOTED_METHOD_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetQuotedMethodController {
+
+    @RequestMapping(value = "/quoted", method = "GET")
+    public String quoted() {
+        return "ok";
+    }
+}
+"""
+
+
+EMPTY_METHOD_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetEmptyMethodController {
+
+    @RequestMapping(value = "/empty", method = {})
+    public String empty() {
+        return "ok";
+    }
+}
+"""
+
+
+def test_lowercase_bare_var_abstains_never_compatible(tmp_path):
+    from bo_java.spring_sql_bindings import extract_client_urls
+
+    routes, _ = _routes_for(
+        tmp_path, "WidgetLowercaseVarController.java", LOWERCASE_VAR_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] is None, routes
+    assert routes[0]["verb_unknown"] is True, routes
+    ops = emit_annotation_operations(routes)
+    assert ops and ops[0].get("linkable") is False, ops
+    client_src = _write(
+        tmp_path,
+        "LowerClient.java",
+        "package com.example.widgets;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+        "public class LowerClient {\n"
+        "    private final RestTemplate restTemplate = new RestTemplate();\n"
+        "    public String call() {\n"
+        '        String url = "http://widget-svc.local/lower";\n'
+        "        return restTemplate.getForObject(url, String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    urls = extract_client_urls(client_src)
+    links = link_client_to_annotation(urls[0], ops)
+    assert links, links
+    assert all(link["compatible"] is False for link in links), links
+
+
+def test_single_without_braces_comma_abstains(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "WidgetSingleCommaController.java", SINGLE_COMMA_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] is None, routes
+    assert routes[0]["verb_unknown"] is True, routes
+
+
+def test_positional_multi_without_braces_abstains(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path,
+        "WidgetPositionalMultiController.java",
+        POSITIONAL_MULTI_CONTROLLER,
+    )
+    assert routes, "positional multi must still yield a record with a reason"
+    assert all(r["path"] is None for r in routes), routes
+    assert all("dynamic" in str(r.get("reason", "")).lower() for r in routes), routes
+
+
+def test_quoted_method_abstains_never_compatible(tmp_path):
+    from bo_java.spring_sql_bindings import extract_client_urls
+
+    routes, _ = _routes_for(
+        tmp_path, "WidgetQuotedMethodController.java", QUOTED_METHOD_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] is None, routes
+    assert routes[0]["verb_unknown"] is True, routes
+    ops = emit_annotation_operations(routes)
+    assert ops and ops[0].get("linkable") is False, ops
+    client_src = _write(
+        tmp_path,
+        "QuotedClient.java",
+        "package com.example.widgets;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+        "public class QuotedClient {\n"
+        "    private final RestTemplate restTemplate = new RestTemplate();\n"
+        "    public String call() {\n"
+        '        String url = "http://widget-svc.local/quoted";\n'
+        "        return restTemplate.getForObject(url, String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    urls = extract_client_urls(client_src)
+    links = link_client_to_annotation(urls[0], ops)
+    assert links, links
+    assert all(link["compatible"] is False for link in links), links
+
+
+def test_empty_method_array_abstains_never_compatible(tmp_path):
+    from bo_java.spring_sql_bindings import extract_client_urls
+
+    routes, _ = _routes_for(
+        tmp_path, "WidgetEmptyMethodController.java", EMPTY_METHOD_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    assert routes[0]["http_methods"] is None, routes
+    assert routes[0]["verb_unknown"] is True, routes
+    ops = emit_annotation_operations(routes)
+    assert ops and ops[0].get("linkable") is False, ops
+    client_src = _write(
+        tmp_path,
+        "EmptyClient.java",
+        "package com.example.widgets;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+        "public class EmptyClient {\n"
+        "    private final RestTemplate restTemplate = new RestTemplate();\n"
+        "    public String call() {\n"
+        '        String url = "http://widget-svc.local/empty";\n'
+        "        return restTemplate.getForObject(url, String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    urls = extract_client_urls(client_src)
+    links = link_client_to_annotation(urls[0], ops)
+    assert links, links
+    assert all(link["compatible"] is False for link in links), links
+
+
+def test_static_import_single_is_linkable_compatible(tmp_path):
+    from bo_java.spring_sql_bindings import extract_client_urls
+
+    routes, _ = _routes_for(
+        tmp_path, "WidgetStaticImportController.java", STATIC_IMPORT_SINGLE_CONTROLLER
+    )
+    ops = emit_annotation_operations(routes)
+    assert len(ops) == 1 and ops[0].get("linkable") is True, ops
+    assert ops[0].get("method") == "post", ops
+    client_src = _write(
+        tmp_path,
+        "StaticPostClient.java",
+        "package com.example.widgets;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+        "public class StaticPostClient {\n"
+        "    private final RestTemplate restTemplate = new RestTemplate();\n"
+        "    public String call() {\n"
+        '        String url = "http://widget-svc.local/static-post";\n'
+        "        return restTemplate.postForObject(url, new Object(), String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    urls = extract_client_urls(client_src)
+    links = link_client_to_annotation(urls[0], ops)
+    assert links and links[0]["compatible"] is True, links
+
+
+def test_unknown_method_never_compatible(tmp_path):
+    from bo_java.spring_sql_bindings import extract_client_urls
+
+    routes, _ = _routes_for(
+        tmp_path, "WidgetUnknownMethodController.java", UNKNOWN_METHOD_CONTROLLER
+    )
+    ops = emit_annotation_operations(routes)
+    assert ops and ops[0].get("linkable") is False, ops
+    client_src = _write(
+        tmp_path,
+        "MysteryClient.java",
+        "package com.example.widgets;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+        "public class MysteryClient {\n"
+        "    private final RestTemplate restTemplate = new RestTemplate();\n"
+        "    public String call() {\n"
+        '        String url = "http://widget-svc.local/mystery";\n'
+        "        return restTemplate.postForObject(url, new Object(), String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    urls = extract_client_urls(client_src)
+    links = link_client_to_annotation(urls[0], ops)
+    assert links, links
+    assert all(link["compatible"] is False for link in links), links
+
+
+def _find_realworld_files():
+    """Shape-based discovery (no literal filenames): all ``*.java`` files
+    containing ``@RequestMapping`` plus a ``method=POST`` marker (qualified
+    ``RequestMethod.POST`` or bare ``POST`` static import)."""
+    import os
+    import re
+
+    override = os.environ.get("REALWORLD_ROOT")
+    roots: list[Path] = []
+    if override:
+        candidate = Path(override)
+        if candidate.is_dir():
+            roots.append(candidate)
+    for base in (
+        "/tmp/opencode/oss-eval-realworld/spring-boot-realworld-example-app",
+        "/tmp/realworld",
+        "/tmp/spring-boot-realworld-example-app",
+    ):
+        root = Path(base)
+        if root.is_dir():
+            roots.append(root)
+    marker = re.compile(r"method\s*=\s*(?:RequestMethod\s*\.\s*)?POST\b")
+    found: list[Path] = []
+    for root in roots:
+        for path in root.glob("**/*.java"):
+            try:
+                if not os.path.isfile(path):
+                    continue
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            if "@RequestMapping" in text and marker.search(text):
+                found.append(path)
+    return found
+
+
+def test_realworld_exposed_regression_requestmapping_post():
+    """REGRESSION (read-only): exposed tree bare static-import POST resolves."""
+    candidates = _find_realworld_files()
+    if not candidates:
+        pytest.skip("RealWorld sources absent under /tmp (no download attempted)")
+    routes = [r for jf in candidates for r in extract_mapping_routes(jf)]
+    assert routes, "setup must find exposed mapping routes"
+    posts = [
+        r
+        for r in routes
+        if (r.get("http_methods") or []) == ["post"] and r.get("path")
+    ]
+    assert posts, routes
+    assert all(r.get("verb_unknown") is False for r in posts), routes
+
+
 def _find_petclinic_files():
+    """Shape-based discovery (no literal filenames): all ``*.java`` files
+    containing a Spring mapping marker (``@RequestMapping``/``@GetMapping``
+    etc). Callers filter further by route/path shape, never by filename."""
     import os
 
     candidates: list[Path] = []
@@ -578,17 +1154,33 @@ def _find_petclinic_files():
         root = Path(base)
         if not root.exists():
             continue
-        for pattern in ("**/OwnerResource.java", "**/ApiGatewayController.java"):
-            candidates.extend(root.glob(pattern))
-    # Deduplicate, keep only the two basenames of interest.
-    wanted = {}
-    for path in candidates:
         try:
-            if os.path.isfile(path):
-                wanted.setdefault(path.name, path)
+            matches = list(root.glob("**/*.java"))
         except OSError:
             continue
-    return wanted
+        for path in matches:
+            try:
+                if not os.path.isfile(path):
+                    continue
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            if (
+                "@RequestMapping" in text
+                or "@GetMapping" in text
+                or "@PostMapping" in text
+                or "@PutMapping" in text
+            ):
+                candidates.append(path)
+    # Deduplicate by resolved path.
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
 
 
 def test_petclinic_exposed_regression_readonly():
@@ -597,12 +1189,13 @@ def test_petclinic_exposed_regression_readonly():
     asserted (all links compatible False)."""
     from bo_java.spring_sql_bindings import extract_client_urls
 
-    wanted = _find_petclinic_files()
-    if "OwnerResource.java" not in wanted or "ApiGatewayController.java" not in wanted:
+    candidates = _find_petclinic_files()
+    if not candidates:
         pytest.skip("PetClinic sources absent under /tmp (no download attempted)")
-    owner_routes = extract_mapping_routes(wanted["OwnerResource.java"])
-    gateway_routes = extract_mapping_routes(wanted["ApiGatewayController.java"])
-    owner_paths = {(tuple(r.get("http_methods") or []), r.get("path")) for r in owner_routes}
+    all_routes = [r for jf in candidates for r in extract_mapping_routes(jf)]
+    if not all_routes:
+        pytest.skip("PetClinic mapping routes absent (no download attempted)")
+    owner_paths = {(tuple(r.get("http_methods") or []), r.get("path")) for r in all_routes}
     assert (("post",), "/owners") in owner_paths, owner_paths
     assert any(
         methods == ("get",) and (path or "").endswith("{ownerId}")
@@ -613,15 +1206,17 @@ def test_petclinic_exposed_regression_readonly():
         for methods, path in owner_paths
     ), owner_paths
     gateway_paths = {
-        (tuple(r.get("http_methods") or []), r.get("path")) for r in gateway_routes
+        (tuple(r.get("http_methods") or []), r.get("path")) for r in all_routes
     }
     assert any(
         methods == ("get",) and "owners" in (path or "") and "{ownerId}" in (path or "")
         for methods, path in gateway_paths
     ), gateway_paths
-    ops = emit_annotation_operations(owner_routes + gateway_routes)
+    ops = emit_annotation_operations(all_routes)
     assert any(o.get("source") == "spring_annotation" for o in ops), ops
-    gateway_urls = extract_client_urls(wanted["ApiGatewayController.java"])
+    gateway_urls = [u for jf in candidates for u in extract_client_urls(jf)]
+    if not gateway_urls:
+        pytest.skip("PetClinic client URLs absent (no download attempted)")
     gateway_links = [
         link
         for url_record in gateway_urls

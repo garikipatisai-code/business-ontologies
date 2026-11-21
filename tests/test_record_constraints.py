@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.bo_java.spring_sql_bindings import (
+from bo_java.spring_sql_bindings import (
     extract_record_constraints,
     has_valid_enforcement,
     link_record_enforcement,
@@ -348,3 +348,57 @@ class TestPreservedSourceRegression:
                 assert "400" not in link["reason"]
         if not found:
             pytest.skip("absent: no record decl in discovered java")
+
+
+_EXTENDED_RECORD = """package demo;
+public record ShipmentRate(
+    @Email String email,
+    @Positive Integer count,
+    @PositiveOrZero Integer stock,
+    @Negative Integer deficit,
+    @NegativeOrZero Integer balance,
+    @Past java.util.Date created,
+    @PastOrPresent java.util.Date updated,
+    @Future java.util.Date expires,
+    @FutureOrPresent java.util.Date validFrom,
+    @DecimalMin("0.0") String minPrice,
+    @DecimalMax(value = "100.0") String maxPrice
+) {
+}
+"""
+
+
+class TestExtendedRecordAnnotations:
+    def test_all_new_annotations_found_with_spans(self, tmp_path):
+        path = _write(tmp_path, "ShipmentRate.java", _EXTENDED_RECORD)
+        records = extract_record_constraints(path)
+        by_ann = {(r["annotation"], r["component"]): r for r in records}
+        for annotation, component in [
+            ("Email", "email"),
+            ("Positive", "count"),
+            ("PositiveOrZero", "stock"),
+            ("Negative", "deficit"),
+            ("NegativeOrZero", "balance"),
+            ("Past", "created"),
+            ("PastOrPresent", "updated"),
+            ("Future", "expires"),
+            ("FutureOrPresent", "validFrom"),
+            ("DecimalMin", "minPrice"),
+            ("DecimalMax", "maxPrice"),
+        ]:
+            assert (annotation, component) in by_ann, (
+                annotation,
+                component,
+                records,
+            )
+        for rec in records:
+            span = rec["span"]
+            assert span["start_line"] <= rec["line"] <= span["end_line"]
+            assert isinstance(rec["params"], dict)
+
+    def test_decimal_params_preserved(self, tmp_path):
+        path = _write(tmp_path, "ShipmentRate.java", _EXTENDED_RECORD)
+        records = extract_record_constraints(path)
+        by_ann = {(r["annotation"], r["component"]): r for r in records}
+        assert by_ann[("DecimalMin", "minPrice")]["params"] == {"value": "0.0"}
+        assert by_ann[("DecimalMax", "maxPrice")]["params"] == {"value": "100.0"}

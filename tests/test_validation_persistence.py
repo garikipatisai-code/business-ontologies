@@ -775,3 +775,214 @@ class TestWrappedSignatureAbstains:
         result = has_valid_enforcement(path)
         assert result["verified"] is False
         assert result["methods"] == []
+
+
+# ---------------------------------------------------------------- extended Bean Validation set
+
+
+_EXTENDED_MODEL = """\
+package example;
+
+public class WidgetShipment {
+    @Email
+    private String email;
+
+    @Positive
+    private Integer count;
+
+    @PositiveOrZero
+    private Integer stock;
+
+    @Negative
+    private Integer deficit;
+
+    @NegativeOrZero
+    private Integer balance;
+
+    @Past
+    private java.util.Date created;
+
+    @PastOrPresent
+    private java.util.Date updated;
+
+    @Future
+    private java.util.Date expires;
+
+    @FutureOrPresent
+    private java.util.Date validFrom;
+
+    @DecimalMin("0.0")
+    private String minPrice;
+
+    @DecimalMax(value = "100.0")
+    private String maxPrice;
+}
+"""
+
+
+class TestExtendedConstraintAnnotations:
+    def test_all_new_annotations_found_with_spans(self, tmp_path):
+        path = _write(tmp_path, "WidgetShipment.java", _EXTENDED_MODEL)
+        records = extract_field_constraints(path)
+        by_ann = {(r["annotation"], r["field"]): r for r in records}
+        for annotation, field in [
+            ("Email", "email"),
+            ("Positive", "count"),
+            ("PositiveOrZero", "stock"),
+            ("Negative", "deficit"),
+            ("NegativeOrZero", "balance"),
+            ("Past", "created"),
+            ("PastOrPresent", "updated"),
+            ("Future", "expires"),
+            ("FutureOrPresent", "validFrom"),
+            ("DecimalMin", "minPrice"),
+            ("DecimalMax", "maxPrice"),
+        ]:
+            assert (annotation, field) in by_ann, (annotation, field, records)
+        for record in records:
+            span = record["span"]
+            assert span["start_line"] <= record["line"] <= span["end_line"]
+            assert isinstance(record["params"], dict)
+
+    def test_decimal_params_preserved(self, tmp_path):
+        path = _write(tmp_path, "WidgetShipment.java", _EXTENDED_MODEL)
+        records = extract_field_constraints(path)
+        by_ann = {(r["annotation"], r["field"]): r for r in records}
+        assert by_ann[("DecimalMin", "minPrice")]["params"] == {"value": "0.0"}
+        assert by_ann[("DecimalMax", "maxPrice")]["params"] == {"value": "100.0"}
+
+    def test_getter_with_new_annotation_uses_property_name(self, tmp_path):
+        text = (
+            "public class WidgetContact {\n"
+            "    private String email;\n"
+            "    @Email\n"
+            "    public String getEmail() {\n"
+            "        return email;\n"
+            "    }\n"
+            "}\n"
+        )
+        path = _write(tmp_path, "WidgetContact.java", text)
+        records = extract_field_constraints(path)
+        assert len(records) == 1
+        assert records[0]["annotation"] == "Email"
+        assert records[0]["field"] == "email"
+
+    def test_non_validation_annotation_still_none(self, tmp_path):
+        text = (
+            "public class WidgetPart {\n"
+            "    @Deprecated\n"
+            "    private String code;\n"
+            "}\n"
+        )
+        path = _write(tmp_path, "WidgetPart.java", text)
+        assert extract_field_constraints(path) == []
+
+    def test_extended_model_declared_only_without_valid(self, tmp_path):
+        path = _write(tmp_path, "WidgetShipment.java", _EXTENDED_MODEL)
+        assert extract_field_constraints(path), "setup must declare constraints"
+        result = has_valid_enforcement(path)
+        assert result["verified"] is False
+        assert "400" not in result["reason"]
+
+
+def _realworld_root() -> Path | None:
+    override = os.environ.get("REALWORLD_ROOT")
+    if override:
+        candidate = Path(override)
+        if candidate.is_dir():
+            return candidate
+    for base in (
+        "/tmp/opencode/oss-eval-realworld/spring-boot-realworld-example-app",
+        "/tmp/realworld",
+        "/tmp/spring-boot-realworld-example-app",
+    ):
+        fallback = Path(base)
+        if fallback.is_dir():
+            return fallback
+    return None
+
+
+class TestRealWorldExposedRegression:
+    def test_register_param_email_found(self):
+        """REGRESSION (read-only): exposed tree @Email constraint is found
+        (shape-based discovery: all ``*.java`` containing ``@Email``,
+        never a literal filename)."""
+        root = _realworld_root()
+        if root is None:
+            pytest.skip("RealWorld tree absent (read-only)")
+        candidates = [
+            jf
+            for jf in root.glob("**/*.java")
+            if jf.is_file()
+            and "@Email" in jf.read_text(encoding="utf-8", errors="ignore")
+        ]
+        if not candidates:
+            pytest.skip("Exposed @Email sources absent (no download attempted)")
+        found = [r for jf in candidates for r in extract_field_constraints(jf)]
+        emails = [r for r in found if r.get("annotation") == "Email"]
+        assert emails, found
+        for record in emails:
+            span = record["span"]
+            assert span["start_line"] <= record["line"] <= span["end_line"]
+
+
+class TestValidInStringAbstains:
+    def test_requestbody_string_valid_does_not_verify(self, tmp_path):
+        text = (
+            "public class WidgetController {\n"
+            '    public String create(@RequestBody(" @Valid ") Widget widget) {\n'
+            '        return "ok";\n'
+            "    }\n"
+            "}\n"
+        )
+        path = _write(tmp_path, "WidgetController.java", text)
+        result = has_valid_enforcement(path)
+        assert result["verified"] is False
+        assert result["methods"] == []
+
+
+class TestGetterDecapUrl:
+    def test_get_url_keeps_uppercase_suffix(self, tmp_path):
+        text = (
+            "public class Widget {\n"
+            "    private String uRL;\n"
+            "    @NotNull\n"
+            "    public String getURL() {\n"
+            "        return uRL;\n"
+            "    }\n"
+            "}\n"
+        )
+        path = _write(tmp_path, "Widget.java", text)
+        records = extract_field_constraints(path)
+        assert len(records) == 1, records
+        assert records[0]["field"] == "URL", records
+
+
+class TestDuplicateSimpleNameAbstains:
+    def test_same_name_different_files_yields_ambiguous_gap(self, tmp_path):
+        pkg_a = tmp_path / "a"
+        pkg_b = tmp_path / "b"
+        pkg_a.mkdir()
+        pkg_b.mkdir()
+        base_a = pkg_a / "Widget.java"
+        base_a.write_text(
+            "package a;\npublic class Widget {\n    @NotNull\n    private String sku;\n}\n",
+            encoding="utf-8",
+        )
+        base_b = pkg_b / "Widget.java"
+        base_b.write_text(
+            "package b;\npublic class Widget {\n    @NotNull\n    private String other;\n}\n",
+            encoding="utf-8",
+        )
+        child = _write(
+            tmp_path,
+            "Gadget.java",
+            "public class Gadget extends Widget {\n}\n",
+        )
+        resolved = resolve_inheritance([child, base_a, base_b])
+        gaps = [r for r in resolved if r.get("kind") == "inheritance_gap"]
+        assert gaps, resolved
+        assert all(g["resolved"] is False for g in gaps), gaps
+        assert any("ambiguous" in str(g.get("reason", "")).lower() for g in gaps), gaps
+        inherited = [r for r in resolved if r.get("inherited") is True]
+        assert inherited == [], resolved
