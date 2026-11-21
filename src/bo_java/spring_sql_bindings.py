@@ -116,6 +116,17 @@ _CONCAT_ASSIGN = re.compile(
     r'\b([A-Za-z_][\w]*)\s*=\s*([A-Za-z_][\w]*)\s*\+\s*["\'](/[^"\']*)["\']'
 )
 _VALUE_DEFAULT = re.compile(r'@Value\([^)]*:(https?://[^}"\'\s\)]+)')
+_FLUENT_VERB = re.compile(r"\.(get|post|put|delete|patch)\s*\(\s*\)")
+_FLUENT_URI = re.compile(r"\.uri\s*\(")
+_FLUENT_TYPE_DECL = re.compile(
+    r"\b(?:WebClient|RestClient)(?:\.Builder)?\s+([A-Za-z_][\w]*)"
+)
+_FLUENT_CREATE = re.compile(r"\b(?:WebClient|RestClient)\s*\.\s*(?:create|builder)\s*\(")
+_FLUENT_BUILD_ASSIGN = re.compile(
+    r"\b([A-Za-z_][\w]*)\s*=\s*([A-Za-z_][\w]*)\s*\.\s*build\s*\(\s*\)"
+)
+_FLUENT_CONCAT_ARG = re.compile(r'^\s*([A-Za-z_][\w]*)\s*\+\s*"([^"]*)"')
+_FLUENT_LITERAL_ARG = re.compile(r'^\s*"([^"]*)"')
 
 
 def _resolve_base_literal(lines: list[str], base: str) -> str | None:
@@ -151,6 +162,11 @@ def _infer_client_method_and_line(
 ) -> tuple[str | None, int | None]:
     """Method plus invocation line for a client-URL record.
 
+    Fluent records (WebClient/RestClient ``.verb().uri(...)``) already carry
+    their invocation evidence (verb plus ``.uri()`` call line); it is reused
+    directly so the linkers treat them as declared-only candidates with a
+    call line.
+
     The variable must reach a supported call (postForObject/
     getForObject/put/delete/patchForObject/exchange+HttpMethod, ...)
     in the same method (data-flow by name); otherwise (None, None) or
@@ -165,6 +181,15 @@ def _infer_client_method_and_line(
     ``recv`` is allowlisted). Unsupported receivers (e.g. a custom
     ``FakeSender.postForObject``) never yield a method (abstain).
     """
+    if isinstance(url_record, dict) and url_record.get("fluent") is True:
+        raw = url_record.get("client_method", url_record.get("method"))
+        fluent_method = (
+            str(raw).strip().lower()
+            if raw is not None and str(raw).strip() != ""
+            else None
+        )
+        fluent_call = url_record.get("call_line")
+        return fluent_method, fluent_call if isinstance(fluent_call, int) else None
     try:
         lines = Path(url_record["file"]).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
@@ -2399,6 +2424,250 @@ def extract_client_urls(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _fluent_assign_sites(lines: list[str], base: str) -> list[int]:
+    """1-based lines assigning ``base`` (any right-hand side).
+
+    Counts ``base = ...`` and ``this.base = ...`` while excluding ``==``.
+    A field initializer plus a setter-body assignment therefore counts as
+    two sites (reassignable: abstain), even when only one assigns a literal.
+    """
+    pattern = re.compile(
+        r"(?<![=!<>])\b(?:this\s*\.\s*)?" + re.escape(base) + r"\s*=(?![=>])"
+    )
+    return [num for num, text in enumerate(lines, start=1) if pattern.search(text)]
+
+
+def _fluent_receivers(
+    lines: list[str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """WebClient/RestClient receivers: typed vars plus builder-built vars.
+
+    ``allowed`` maps each variable declared with a ``WebClient``/
+    ``RestClient`` (or ``.Builder``) type to its declaration line;
+    ``built`` maps each ``<var> = <allowed>.build()`` target to its line.
+    """
+    allowed: dict[str, int] = {}
+    for num, text in enumerate(lines, start=1):
+        for match in _FLUENT_TYPE_DECL.finditer(text):
+            allowed.setdefault(match.group(1), num)
+    built: dict[str, int] = {}
+    for num, text in enumerate(lines, start=1):
+        for match in _FLUENT_BUILD_ASSIGN.finditer(text):
+            if match.group(2) in allowed:
+                built.setdefault(match.group(1), num)
+    return allowed, built
+
+
+def _fluent_root_ok(
+    segment: str, allowed: dict[str, int], built: dict[str, int]
+) -> tuple[str | None, int | None]:
+    """Receiver check for one fluent statement segment.
+
+    Returns ``(receiver, decl_line)`` when the segment chains a declared
+    ``WebClient``/``RestClient`` (or ``.Builder``) variable -- optionally via
+    ``.build()`` -- or a builder-built variable into a bare fluent verb
+    call, or uses ``WebClient.create(...)``/``WebClient.builder()`` (or the
+    ``RestClient`` equivalents) inline (decl line None). Anything else
+    (arbitrary ``receiver.uri(...)``) yields ``(None, None)`` (abstain,
+    never a record).
+    """
+    for name, decl in {**allowed, **built}.items():
+        if re.search(
+            r"\b" + re.escape(name) + r"\s*\.\s*"
+            r"(?:build\s*\(\s*\)\s*\.\s*)?"
+            r"(?:get|post|put|delete|patch)\s*\(\s*\)",
+            segment,
+        ):
+            return name, decl
+    if _FLUENT_CREATE.search(segment):
+        return "create", None
+    return None, None
+
+
+def _fluent_uri_args(line: str, col: int) -> str | None:
+    """Balanced-paren argument text for the ``.uri(`` call at ``col``.
+
+    Single-line only; ``None`` when the parens do not balance on the line
+    (abstain, never half-parse).
+    """
+    pos = line.find("(", col)
+    if pos == -1:
+        return None
+    depth = 0
+    in_str: str | None = None
+    for idx in range(pos, len(line)):
+        ch = line[idx]
+        if in_str is not None:
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return line[pos + 1:idx]
+    return None
+
+
+def extract_fluent_client_urls(path: Path) -> list[dict[str, Any]]:
+    """Fluent WebClient/RestClient ``.verb().uri(...)`` client URLs.
+
+    A record needs all three in one method: the file must mention
+    ``WebClient`` or ``RestClient`` (type gate: a custom builder with its own
+    ``.uri()`` never counts), a bare fluent verb (``.get()``/``.post()``/
+    ``.put()``/``.delete()``/``.patch()``) chained from a declared
+    ``WebClient``/``RestClient`` (or ``.Builder``) receiver -- optionally via
+    ``.build()`` -- or a builder-built variable (arbitrary receivers
+    abstain), and a ``.uri(...)`` argument that is either an absolute
+    ``http(s)`` literal or ``<base> + "<path>"`` where ``base`` has exactly
+    one assignment site in the file resolving to a single literal
+    (reassigned -- e.g. field initializer plus setter -- dynamic, or
+    unresolved bases abstain with no record). Query strings are kept on the
+    cited expression while ``urlparse`` path matching strips them; verb-less
+    chains (unknown method) yield no record (never compatible True).
+    Only single-line ``.uri(...)`` calls are parsed: a call whose parens do
+    not balance on one line abstains (never half-parsed). A literal or
+    ``base + "<path>"`` argument with trailing ``+ <dynamic>`` content after
+    the match (``.uri("http://h/api/" + id)``,
+    ``.uri(base + "/api/orders/" + orderId)``) is dynamic: abstains with no
+    record (never a truncated URL); only an empty remainder or template
+    variables (``.uri(".../{id}", id)``) are accepted. A ``base`` assigned
+    after its use site (use-before-def) abstains rather than emitting an
+    inverted span.
+
+    Records reuse the ``client_url`` shape (``url``, ``var``, ``method`` from
+    the fluent verb, ``call_line``/``call_text`` at the ``.uri()`` site,
+    ``receiver`` evidence, ``base_span`` plus a ``span`` covering base
+    definition through call site) plus ``fluent: True`` so the linkers pick
+    up the carried invocation evidence as declared-only candidates
+    (``destination_verified`` False, ``equivalent`` never True).
+    """
+    file = Path(path)
+    try:
+        lines = file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return []
+    if not re.search(r"\b(?:WebClient|RestClient)\b", "\n".join(lines)):
+        return []
+    allowed, built = _fluent_receivers(lines)
+    if not allowed and not _FLUENT_CREATE.search("\n".join(lines)):
+        return []
+    try:
+        bodies = _method_bodies(file)
+    except (OSError, UnicodeError):
+        bodies = []
+    scopes: list[tuple[int, list[str]]] = []
+    if bodies:
+        for body in bodies:
+            scopes.append((int(body["base"]), list(body["lines"])))
+    else:
+        scopes.append((1, lines))
+    records: list[dict[str, Any]] = []
+    for base, body in scopes:
+        verbs: list[tuple[int, str]] = []
+        uris: list[tuple[int, int]] = []
+        for offset, text in enumerate(body):
+            lineno = base + offset
+            for match in _FLUENT_VERB.finditer(text):
+                verbs.append((lineno, str(match.group(1)).lower()))
+            for match in _FLUENT_URI.finditer(text):
+                uris.append((lineno, match.start()))
+        for lineno, col in uris:
+            args = _fluent_uri_args(lines[lineno - 1], col)
+            if args is None:
+                continue
+            verb: str | None = None
+            verb_line: int | None = None
+            for vline, vname in verbs:
+                if vline > lineno:
+                    continue
+                if any(vline < ulineno < lineno for ulineno, _ in uris):
+                    continue
+                if vline == lineno:
+                    prefix = lines[vline - 1][:col]
+                    if not re.search(
+                        r"\." + re.escape(vname) + r"\s*\(\s*\)", prefix
+                    ):
+                        continue
+                before_uri = "".join(lines[vline - 1:lineno]).split(".uri(")[0]
+                if ";" in before_uri:
+                    continue
+                verb, verb_line = vname, vline
+            if verb is None or verb_line is None:
+                continue
+            start = verb_line
+            for back in range(verb_line - 1, 0, -1):
+                if re.search(r"[;{}]", lines[back - 1]):
+                    start = back + 1
+                    break
+                start = back
+            segment = "\n".join(lines[start - 1:lineno])
+            receiver, decl_line = _fluent_root_ok(segment, allowed, built)
+            if receiver is None:
+                continue
+            uri_expr = args.strip()
+            base_var: str | None = None
+            base_span: dict[str, int] | None = None
+            literal = _FLUENT_LITERAL_ARG.match(args)
+            if literal is not None:
+                if args[literal.end():].strip().startswith("+"):
+                    continue
+                full = literal.group(1)
+                if not full.startswith(("http://", "https://")):
+                    continue
+            else:
+                concat = _FLUENT_CONCAT_ARG.match(args)
+                if concat is None:
+                    continue
+                if args[concat.end():].strip().startswith("+"):
+                    continue
+                base_var = concat.group(1)
+                suffix = concat.group(2)
+                if "://" in suffix:
+                    continue
+                sites = _fluent_assign_sites(lines, base_var)
+                if len(sites) != 1:
+                    continue
+                if sites[0] > lineno:
+                    continue
+                lit = _resolve_base_literal(lines, base_var)
+                if lit is None:
+                    continue
+                full = lit.rstrip("/") + "/" + suffix.lstrip("/")
+                base_span = {"start_line": sites[0], "end_line": sites[0]}
+            parsed = urlparse(full)
+            if parsed.scheme not in ("http", "https"):
+                continue
+            if not parsed.path.startswith("/"):
+                continue
+            call_text = lines[lineno - 1].strip()
+            record = dict(_base(file, lineno))
+            record.update({
+                "kind": "client_url",
+                "url": full,
+                "var": base_var,
+                "method": verb,
+                "client_method": verb,
+                "call_line": lineno,
+                "call_text": call_text,
+                "receiver": receiver,
+                "receiver_line": decl_line,
+                "uri_expr": uri_expr,
+                "verb_line": verb_line,
+                "base_span": base_span,
+                "span": {
+                    "start_line": base_span["start_line"] if base_span else lineno,
+                    "end_line": lineno,
+                },
+                "fluent": True,
+            })
+            records.append(record)
+    return records
+
+
 # ---------------------------------------------------------------- Java guards and transitions
 
 # Single-line declarations only; wrapped (multi-line) signatures abstain
@@ -3218,6 +3487,7 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
                     annotations.extend(extract_annotations(file))
                     mapping_routes.extend(extract_mapping_routes(file))
                     client_urls.extend(extract_client_urls(file))
+                    client_urls.extend(extract_fluent_client_urls(file))
                     rules, trans = extract_guards(file)
                     enforced_rules.extend(rules)
                     transitions.extend(trans)
@@ -3229,6 +3499,16 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
                     persistence.extend(extract_sql_persistence(file))
 
     contract_links: list[dict[str, Any]] = []
+    deduped: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for record in client_urls:
+        key = (str(record.get("file")), int(record.get("line", -1)),
+               str(record.get("url")))
+        prior = deduped.get(key)
+        if prior is None or (
+            record.get("fluent") is True and prior.get("fluent") is not True
+        ):
+            deduped[key] = record
+    client_urls = list(deduped.values())
     for url_record in client_urls:
         contract_links.extend(link_client_url(url_record, openapi))
     annotation_operations = emit_annotation_operations(mapping_routes)
