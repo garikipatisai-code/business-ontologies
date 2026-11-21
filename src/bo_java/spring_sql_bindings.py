@@ -20,8 +20,12 @@ Extracts binding evidence from fixture sources as plain text:
   ``operationId`` (when present) and its declared ``responses`` (status
   codes plus header names under ``responses:``, each with its line).
 * Bean Validation field constraints (``@NotNull``/``@NotEmpty``/
-  ``@NotBlank``/``@Size`` with params) on field/getter declarations with
-  annotation-to-declaration spans; superclass constraints merge with
+  ``@NotBlank``/``@Size``/``@Digits``/``@Pattern``/``@Min``/``@Max`` with
+  params) on field/getter declarations with
+  annotation-to-declaration spans, plus record-component constraints
+  (``record Name(...)`` inline annotations, same annotation set, as
+  ``record_component_constraint`` records with annotation-to-component
+  spans); superclass constraints merge with
   ``inherited: true`` and the parent span cited when the superclass file
   is in the scanned tree, otherwise an ``inheritance_gap`` (unresolved,
   never fabricated); enforcement is a separate ``@Valid``/``@Validated``
@@ -1014,7 +1018,16 @@ def extract_sql_persistence(path: Path) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------- validation constraints and JPA entities
 
 
-_CONSTRAINT_ANNOTATIONS = {"NotNull", "NotEmpty", "NotBlank", "Size"}
+_CONSTRAINT_ANNOTATIONS = {
+    "NotNull",
+    "NotEmpty",
+    "NotBlank",
+    "Size",
+    "Digits",
+    "Pattern",
+    "Min",
+    "Max",
+}
 _CLASS_DECL = re.compile(
     r"^\s*(?:(?:public|protected|private|abstract|final|sealed)\s+)*"
     r"class\s+([A-Za-z_][\w]*)"
@@ -1071,31 +1084,254 @@ def _unquote(value: str) -> str:
     return text
 
 
+def _scan_balanced_parens(text: str, open_idx: int) -> int | None:
+    """Matching ``)`` for ``(`` at ``open_idx`` (quote+escape aware)."""
+    depth = 0
+    in_str: str | None = None
+    idx = open_idx
+    while idx < len(text):
+        ch = text[idx]
+        if in_str is not None:
+            if ch == "\\" and idx + 1 < len(text):
+                idx += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            idx += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            idx += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+        idx += 1
+    return None
+
+
+def _strip_string_literals(text: str) -> str:
+    """Same-length blanking of ``'...'``/``\"...\"`` (newlines kept).
+
+    Quote+backslash-escape aware so ``"a,b"`` or ``"a\\"b"`` never
+    leaks into name searches (substring false-positive guard).
+    """
+    out = list(text)
+    in_str: str | None = None
+    idx = 0
+    while idx < len(text):
+        ch = text[idx]
+        if in_str is not None:
+            if ch == "\\" and idx + 1 < len(text):
+                if out[idx] != "\n":
+                    out[idx] = " "
+                if text[idx + 1] != "\n":
+                    out[idx + 1] = " "
+                idx += 2
+                continue
+            if ch == in_str:
+                out[idx] = " "
+                in_str = None
+            else:
+                if ch != "\n":
+                    out[idx] = " "
+            idx += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            out[idx] = " "
+            idx += 1
+            continue
+        idx += 1
+    return "".join(out)
+
+
+def _strip_java_comments(text: str) -> str:
+    """Remove ``//``/``/* */`` outside strings (quote+escape aware)."""
+    out: list[str] = []
+    in_str: str | None = None
+    idx = 0
+    n = len(text)
+    while idx < n:
+        ch = text[idx]
+        nxt = text[idx + 1] if idx + 1 < n else ""
+        if in_str is not None:
+            out.append(ch)
+            if ch == "\\" and idx + 1 < n:
+                out.append(text[idx + 1])
+                idx += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            idx += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            out.append(ch)
+            idx += 1
+            continue
+        if ch == "/" and nxt == "/":
+            while idx < n and text[idx] != "\n":
+                idx += 1
+            continue
+        if ch == "/" and nxt == "*":
+            idx += 2
+            while idx < n and not (
+                text[idx] == "*" and idx + 1 < n and text[idx + 1] == "/"
+            ):
+                if text[idx] == "\n":
+                    out.append("\n")
+                idx += 1
+            idx += 2 if idx < n else 0
+            out.append(" ")
+            continue
+        out.append(ch)
+        idx += 1
+    return "".join(out)
+
+
+def _blank_strings_and_comments(text: str) -> str:
+    """Same-length blanking of strings/comments (newlines kept).
+
+    Used for ``record`` decl search so a record keyword inside a
+    comment or string literal never fabricates a declaration; offsets
+    (and therefore line numbers) are preserved.
+    """
+    out = list(text)
+    in_str: str | None = None
+    idx = 0
+    n = len(text)
+    while idx < n:
+        ch = text[idx]
+        if in_str is not None:
+            if ch == "\\" and idx + 1 < n:
+                if out[idx] != "\n":
+                    out[idx] = " "
+                if text[idx + 1] != "\n":
+                    out[idx + 1] = " "
+                idx += 2
+                continue
+            if ch == in_str:
+                out[idx] = " "
+                in_str = None
+            else:
+                if ch != "\n":
+                    out[idx] = " "
+            idx += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            out[idx] = " "
+            idx += 1
+            continue
+        if ch == "/" and idx + 1 < n and text[idx + 1] == "/":
+            out[idx] = " "
+            out[idx + 1] = " "
+            idx += 2
+            while idx < n and text[idx] != "\n":
+                out[idx] = " "
+                idx += 1
+            continue
+        if ch == "/" and idx + 1 < n and text[idx + 1] == "*":
+            out[idx] = " "
+            out[idx + 1] = " "
+            idx += 2
+            while idx < n:
+                if text[idx] == "*" and idx + 1 < n and text[idx + 1] == "/":
+                    out[idx] = " "
+                    out[idx + 1] = " "
+                    idx += 2
+                    break
+                if text[idx] != "\n":
+                    out[idx] = " "
+                idx += 1
+            continue
+        idx += 1
+    return "".join(out)
+
+
+def _find_inline_annotations(comp_text: str) -> list[tuple[str, str, int]]:
+    """``(name, args_text, start)`` with balanced-paren args.
+
+    Quote+escape aware so ``@Size(min=Math.max(1,2))`` keeps its full
+    args and ``@Pattern(regexp="a,b")`` keeps the quoted comma.
+    Unbalanced args yield ``""`` (abstain, never half-parsed).
+    """
+    results: list[tuple[str, str, int]] = []
+    for match in re.finditer(r"@([A-Za-z_][\w\.]*)", comp_text):
+        name = match.group(1)
+        idx = match.end()
+        while idx < len(comp_text) and comp_text[idx].isspace():
+            idx += 1
+        if idx < len(comp_text) and comp_text[idx] == "(":
+            close = _scan_balanced_parens(comp_text, idx)
+            if close is None:
+                results.append((name, "", match.start()))
+                continue
+            results.append((name, comp_text[idx : close + 1], match.start()))
+        else:
+            results.append((name, "", match.start()))
+    return results
+
+
 def _annotation_params(args_text: str) -> dict[str, str]:
-    """Bare ``(k=v, ...)`` annotation args; quote-aware, strings unquoted."""
+    """Bare ``(k=v, ...)`` annotation args; quote+escape and ``()`` aware.
+
+    Splits on top-level commas only (paren depth 0, outside strings)
+    so ``Math.max(1,2)`` and quoted commas (``"a,b"``) survive intact;
+    strings unquoted. Backslash escapes inside strings respected.
+    """
     params: dict[str, str] = {}
     text = (args_text or "").strip()
     if not text.startswith("("):
         return params
-    inner = text[1:]
-    if inner.endswith(")"):
-        inner = inner[:-1]
+    close = _scan_balanced_parens(text, 0)
+    if close is None:
+        return params
+    inner = text[1:close]
     parts: list[str] = []
     buf = ""
+    depth = 0
     in_str: str | None = None
-    for ch in inner:
+    idx = 0
+    while idx < len(inner):
+        ch = inner[idx]
         if in_str is not None:
             buf += ch
+            if ch == "\\" and idx + 1 < len(inner):
+                buf += inner[idx + 1]
+                idx += 2
+                continue
             if ch == in_str:
                 in_str = None
-        elif ch in ("'", '"'):
+            idx += 1
+            continue
+        if ch in ("'", '"'):
             in_str = ch
             buf += ch
-        elif ch == ",":
+            idx += 1
+            continue
+        if ch == "(":
+            depth += 1
+            buf += ch
+            idx += 1
+            continue
+        if ch == ")":
+            if depth > 0:
+                depth -= 1
+            buf += ch
+            idx += 1
+            continue
+        if ch == "," and depth == 0:
             parts.append(buf)
             buf = ""
-        else:
-            buf += ch
+            idx += 1
+            continue
+        buf += ch
+        idx += 1
     parts.append(buf)
     for part in parts:
         part = part.strip()
@@ -1198,6 +1434,345 @@ def extract_field_constraints(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+_RECORD_DECL = re.compile(
+    r"(?<![\w.])record\s+([A-Za-z_][\w]*)\s*(?:<[^;{}]*>)?\s*\("
+)
+_INLINE_ANNOTATION = re.compile(
+    r"@([A-Za-z_][\w\.]*)\s*(\((?:[^()\"']|\"[^\"]*\"|'[^']*')*\))?"
+)
+# NOTE: _INLINE_ANNOTATION is retained for compatibility but superseded by
+# _find_inline_annotations (balanced-paren, quote+escape aware) for nested
+# calls like Math.max(1,2); do not use it for arg capture.
+
+
+def _line_starts(text: str) -> list[int]:
+    """Absolute offsets where each 1-based line starts."""
+    starts = [0]
+    for match in re.finditer(r"\n", text):
+        starts.append(match.end())
+    return starts
+
+
+def _line_of(starts: list[int], offset: int) -> int:
+    """1-based line number containing ``offset``."""
+    import bisect
+
+    return bisect.bisect_right(starts, offset)
+
+
+def _split_components(inner: str) -> list[tuple[str, int, int]]:
+    """Split record-header inner text on top-level commas.
+
+    Returns ``[(text, start_offset, end_offset)]`` relative to ``inner``;
+    ``<>[](){}`` nesting plus single/double quotes are respected so
+    generic defaults and quoted commas never split (abstain-safe).
+    """
+    parts: list[tuple[str, int, int]] = []
+    depth_angle = depth_paren = depth_brack = depth_brace = 0
+    in_str: str | None = None
+    start = 0
+    idx = 0
+    while idx < len(inner):
+        ch = inner[idx]
+        if in_str is not None:
+            if ch == "\\" and idx + 1 < len(inner):
+                idx += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            idx += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            idx += 1
+            continue
+        if ch == "<":
+            depth_angle += 1
+        elif ch == ">":
+            if depth_angle > 0:
+                depth_angle -= 1
+        elif ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            if depth_paren > 0:
+                depth_paren -= 1
+        elif ch == "[":
+            depth_brack += 1
+        elif ch == "]":
+            if depth_brack > 0:
+                depth_brack -= 1
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            if depth_brace > 0:
+                depth_brace -= 1
+        elif ch == "," and not (
+            depth_angle or depth_paren or depth_brack or depth_brace
+        ):
+            parts.append((inner[start:idx], start, idx))
+            start = idx + 1
+        idx += 1
+    parts.append((inner[start:], start, len(inner)))
+    return parts
+
+
+def extract_record_constraints(path: Path) -> list[dict[str, Any]]:
+    """Bean Validation constraints on Java ``record`` components.
+
+    Each ``record Name[<...}](...)`` header (single- or multi-line,
+    balanced parens, same file, optional generic type-params) is
+    scanned; every inline ``@X[(params)]`` on a component whose short
+    name is in ``_CONSTRAINT_ANNOTATIONS`` becomes a
+    ``record_component_constraint`` record (``record``/``class`` name,
+    ``component``/``field`` name, annotation, params, annotation line,
+    annotation-to-component span, plus the ``record_header`` span).
+    Annotation args use balanced-paren parsing (quote+escape aware) so
+    ``Math.max(1,2)`` and quoted commas survive. Unannotated
+    components and non-validation annotations yield nothing; regular
+    method params (outside a record header) are never emitted; compact
+    constructors (``Name(...)``, no ``record`` keyword) never
+    double-count; unbalanced headers abstain (no records, no crash).
+    A header whose inner contains another ``record`` decl, ``{`` or
+    ``;`` (quote/string stripped) is malformed (unbounded scan past a
+    missing close) and abstains; over-long headers (>5000 chars)
+    abstain. ``record`` inside comments/strings never declares
+    (same-length blanking preserves offsets). ``//``/``/* */``
+    comments are stripped before component naming so ``/* note */``
+    never becomes the component.
+
+    NOTE (deferred, documented not fixed): ``record`` in a comment or
+    string is blanked for discovery (fixed); interface decls without a
+    body are out of scope; ``\\`` escapes inside literals are handled
+    in scanners (blanking/splitting/params).
+    """
+    records: list[dict[str, Any]] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    starts = _line_starts(text)
+    search_text = _blank_strings_and_comments(text)
+    for decl in _RECORD_DECL.finditer(search_text):
+        name = decl.group(1)
+        open_paren = decl.end() - 1
+        depth = 0
+        in_str: str | None = None
+        close: int | None = None
+        idx = open_paren
+        while idx < len(text):
+            ch = text[idx]
+            if in_str is not None:
+                if ch == "\\" and idx + 1 < len(text):
+                    idx += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+                idx += 1
+                continue
+            if ch in ("'", '"'):
+                in_str = ch
+                idx += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close = idx
+                    break
+            idx += 1
+        if close is None:
+            continue
+        inner = text[open_paren + 1 : close]
+        if (close - open_paren) > 5000:
+            continue
+        probe = _strip_string_literals(_strip_java_comments(inner))
+        if re.search(
+            r"\brecord\s+[A-Za-z_][\w]*\s*(?:<[^;{}]*>)?\s*\(", probe
+        ):
+            continue
+        if "{" in probe or ";" in probe:
+            continue
+        header_start_line = _line_of(starts, decl.start())
+        header_end_line = _line_of(starts, close)
+        for comp_text, rel_start, rel_end in _split_components(inner):
+            comp_start = open_paren + 1 + rel_start
+            comp_end = open_paren + 1 + rel_end
+            if not comp_text.strip():
+                continue
+            comp_nocomments = _strip_java_comments(comp_text)
+            annotations = _find_inline_annotations(comp_nocomments)
+            if not annotations:
+                continue
+            stripped = re.sub(
+                r"@[A-Za-z_][\w\.]*(\s*\((?:[^()\"']|\"(?:[^\"\\]|\\.)*\""
+                r"|'(?:[^'\\]|\\.)*')*\))?",
+                " ",
+                comp_nocomments,
+            )
+            stripped = _strip_java_comments(stripped)
+            stripped = _strip_string_literals(stripped)
+            tokens = re.findall(r"[A-Za-z_][\w]*", stripped)
+            if not tokens:
+                continue
+            component = tokens[-1]
+            comp_end_line = _line_of(starts, max(comp_end - 1, comp_start))
+            for full_name, args_text, rel_pos in annotations:
+                short = full_name.split(".")[-1]
+                if short not in _CONSTRAINT_ANNOTATIONS:
+                    continue
+                anno_line = _line_of(starts, comp_start + rel_pos)
+                record = dict(_base(path, anno_line))
+                record.update({
+                    "kind": "record_component_constraint",
+                    "record": name,
+                    "class": name,
+                    "component": component,
+                    "field": component,
+                    "annotation": short,
+                    "params": _annotation_params(args_text or ""),
+                    "inherited": False,
+                    "span": {
+                        "start_line": anno_line,
+                        "end_line": comp_end_line,
+                    },
+                    "record_header": {
+                        "start_line": header_start_line,
+                        "end_line": header_end_line,
+                    },
+                })
+                records.append(record)
+    return records
+
+
+def link_record_enforcement(
+    record_name: str, candidate_files: list[Path | str]
+) -> dict[str, Any]:
+    """Enforcement linkage for a record type used as a bound parameter.
+
+    ``verified`` True only with same-method evidence: ONE top-level
+    parameter chunk naming ``record_name`` that also carries
+    ``@Valid``/``@Validated`` in that same chunk (sibling-``@Valid``
+    on another param never verifies; param-list only, return position
+    excluded via :func:`_signature_param_text`; string literals
+    stripped before matching so ``"Parcel"`` never verifies), or a
+    parameter list naming the record in a method whose body makes an
+    explicit ``validator.validate(...)`` call. A bare
+    ``Validation.buildDefaultValidatorFactory()`` without
+    ``validate(`` abstains (never verified alone). Empty
+    ``record_name`` abstains (verified False). Otherwise ``verified``
+    False (declared-only, never an HTTP 400 claim).
+
+    NOTE (documented, not fixed): multi-line controller signatures
+    abstain by design (single-line only, no half-parse); interface
+    decls without bodies are out of scope; ``@Validated(OnCreate)``
+    counts the same as ``@Validated`` (variant not distinguished).
+    """
+    files = [Path(p) for p in candidate_files or []]
+    methods: list[dict[str, Any]] = []
+    clean_name = str(record_name or "").strip()
+    want = (
+        re.compile(r"\b" + re.escape(clean_name) + r"\b")
+        if clean_name
+        else None
+    )
+    for file in files:
+        try:
+            lines = file.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        try:
+            bodies = _method_bodies(file)
+        except (OSError, UnicodeError):
+            bodies = []
+        for body in bodies:
+            if want is None:
+                continue
+            signature = "\n".join(lines[body["decl"] - 1 : body["base"] - 1])
+            param_text = _signature_param_text(signature)
+            if param_text is None:
+                continue
+            bound = False
+            for chunk, _, _ in _split_components(
+                _strip_java_comments(param_text)
+            ):
+                probe = _strip_string_literals(
+                    _strip_java_comments(chunk)
+                )
+                if want.search(probe) and _VALID_PARAM.search(probe):
+                    bound = True
+                    break
+            kinds: list[tuple[str, int]] = []
+            if bound:
+                kinds.append(("valid_param", body["decl"]))
+            else:
+                probe_all = _strip_string_literals(
+                    _strip_java_comments(param_text)
+                )
+                if not want.search(probe_all):
+                    continue
+            for offset, text in enumerate(body["lines"]):
+                if _VALIDATOR_CALL.search(text):
+                    kinds.append(
+                        ("validator_call", body["base"] + offset)
+                    )
+                    break
+            if kinds:
+                start = min([body["decl"]] + [line for _, line in kinds])
+                end = max([line for _, line in kinds])
+                methods.append({
+                    "file": str(file),
+                    "method": body["name"],
+                    "decl_line": body["decl"],
+                    "evidence": [kind for kind, _ in kinds],
+                    "span": {"start_line": start, "end_line": end},
+                })
+    if files:
+        try:
+            base = dict(_base(files[0], methods[0]["span"]["start_line"] if methods else 1))
+        except (OSError, UnicodeError):
+            base = {
+                "origin": ORIGIN,
+                "extractor_version": EXTRACTOR_VERSION,
+                "file": str(files[0]),
+                "line": 1,
+                "content_hash": "",
+            }
+    else:
+        base = {
+            "origin": ORIGIN,
+            "extractor_version": EXTRACTOR_VERSION,
+            "file": "",
+            "line": 1,
+            "content_hash": "",
+        }
+    if methods:
+        detail = "; ".join(
+            f"{m['method']} via {','.join(m['evidence'])} "
+            f"(L{m['span']['start_line']}-L{m['span']['end_line']})"
+            for m in methods
+        )
+        reason = (
+            f"enforced: record {record_name!r} bound with validation "
+            f"evidence: {detail}; same-method evidence only"
+        )
+    else:
+        reason = (
+            f"declared-only: no @Valid/@Validated param binding "
+            f"record {record_name!r} or validator call in candidate "
+            "files (no enforcement evidence)"
+        )
+    base.update({
+        "kind": "record_enforcement",
+        "record": record_name,
+        "verified": bool(methods),
+        "methods": methods,
+        "evidence_spans": [m["span"] for m in methods],
+        "reason": reason,
+    })
+    return base
+
+
 def resolve_inheritance(paths: list[Path | str]) -> list[dict[str, Any]]:
     """Merge superclass constraints / report gaps over a scanned tree.
 
@@ -1298,11 +1873,16 @@ def _signature_param_text(signature: str) -> str | None:
         return None
     depth = 0
     in_str: str | None = None
-    for idx in range(start, len(signature)):
+    idx = start
+    while idx < len(signature):
         ch = signature[idx]
         if in_str is not None:
+            if ch == "\\" and idx + 1 < len(signature):
+                idx += 2
+                continue
             if ch == in_str:
                 in_str = None
+            idx += 1
             continue
         if ch in ("'", '"'):
             in_str = ch
@@ -1312,6 +1892,7 @@ def _signature_param_text(signature: str) -> str | None:
             depth -= 1
             if depth == 0:
                 return signature[start + 1:idx]
+        idx += 1
     return None
 
 
@@ -1320,16 +1901,15 @@ def has_valid_enforcement(path: Path) -> dict[str, Any]:
 
     ``verified`` True only with same-method evidence: a ``@Valid``/
     ``@Validated`` bound param inside the parameter list (``@Valid`` in
-    the return position alone never verifies), or an explicit validator
-    call (``validator.validate(...)`` /
-    ``Validation.buildDefaultValidatorFactory()``) in the body. Otherwise
+    the return position alone never verifies), or an explicit
+    ``validator.validate(...)`` call in the body. A bare
+    ``Validation.buildDefaultValidatorFactory()`` without
+    ``validate(`` abstains (never verified alone). Otherwise
     ``verified`` False (declared only; never an HTTP 400 claim).
 
     NOTE (deferred, documented not fixed): the validator receiver name is
     fixed (``validator``); custom-named ``Validator`` variables abstain.
-    A ``Validation.buildDefaultValidatorFactory()`` call counts as
-    validator-call evidence (factory alone, without ``validate(...)``,
-    is recorded the same way).
+    Multi-line signatures abstain by design (single-line only).
     """
     file = Path(path)
     try:
@@ -1364,7 +1944,7 @@ def has_valid_enforcement(path: Path) -> dict[str, Any]:
         if param_text is not None and _VALID_PARAM.search(param_text):
             kinds.append(("valid_param", body["decl"]))
         for offset, text in enumerate(body["lines"]):
-            if _VALIDATOR_CALL.search(text) or _VALIDATOR_FACTORY.search(text):
+            if _VALIDATOR_CALL.search(text):
                 kinds.append(("validator_call", body["base"] + offset))
                 break
         if kinds:
@@ -3477,6 +4057,7 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
     client_urls: list[dict[str, Any]] = []
     enforced_rules: list[dict[str, Any]] = []
     transitions: list[dict[str, Any]] = []
+    record_constraints: list[dict[str, Any]] = []
 
     for repo in repos:
         for root, dirs, names in os.walk(repo):
@@ -3491,6 +4072,7 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
                     rules, trans = extract_guards(file)
                     enforced_rules.extend(rules)
                     transitions.extend(trans)
+                    record_constraints.extend(extract_record_constraints(file))
                 elif _is_openapi(name):
                     openapi.extend(extract_openapi(file))
                 elif name in ("application.yml", "application.yaml") or name.endswith(".yml") or name.endswith(".yaml"):
@@ -3530,6 +4112,7 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
             "contract_links": contract_links,
             "enforced_rules": enforced_rules,
             "transitions": transitions,
+            "record_constraints": record_constraints,
         },
         "counts": {
             "annotations": len(annotations),
@@ -3542,6 +4125,7 @@ def index(repo_paths: list[Path | str]) -> dict[str, Any]:
             "contract_links": len(contract_links),
             "enforced_rules": len(enforced_rules),
             "transitions": len(transitions),
+            "record_constraints": len(record_constraints),
         },
         "limitation": YAML_LIMITATION,
     }
