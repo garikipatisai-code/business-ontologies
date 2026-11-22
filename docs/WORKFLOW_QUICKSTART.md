@@ -101,7 +101,15 @@ candidates), so do not sum those two counts. Every `active`/`stale` entry also c
 additive nullable `provenance` object (`{repo,file,line,span,...}`) sourced
 from stored `supporting`/trigger/description JSON or `evidence[0]` without
 parsing display names (`None` when no stored provenance exists); all other
-keys keep byte-identical values.
+keys keep byte-identical values. Every `contract_links` entry carries an
+additive `backing` object (`{status: active|stale-or-missing, reason, ...}`):
+`compatible` is the historical contract-match result, `backing` is the
+current liveness (exactly one active operation matches
+`operation_repo+openapi_path+operation_method`, otherwise `stale-or-missing`
+with a cause: no active backing / ambiguous N candidates / backing
+invalidated (all known triggers joined deterministically) / source removed
+/ missing identity / redacted identity (permanent fail-closed)). Historical links are never
+deleted or re-audited; `counts.contract_links` equals displayed rows.
 
 Readable Markdown (deterministic: no timestamps, sections sorted):
 
@@ -118,7 +126,10 @@ tables carry an explicit `Provenance` column rendering
 `<repo>:<file>:L<start>-L<end>` where stored, or
 `source provenance unavailable` when no stored provenance exists
 (`[REDACTED]` is preserved verbatim); names still show `repo:key` for params
-and target for transitions.
+and target for transitions. `Cross-Repo Contract Links` carries an explicit
+`Backing` column (`active` vs `stale-or-missing` + reason) alongside the
+historical `Compatible`/`Equivalent`/`Destination Verified` columns;
+`counts` equal displayed rows (no silent drops).
 
 Python API:
 
@@ -138,7 +149,9 @@ explicit `Provenance` column.
   section, so two runs over the same store are byte-identical.
 - Contract links are declared-only: `destination_verified` is always false
   and `equivalent` is never true; a compatible link is not delivery or
-  destination proof.
+  destination proof. `Compatible` is historical; `Backing` (`active` vs
+  `stale-or-missing`) is current liveness (repo+path+method, fail closed);
+  active backing alone proves no freshness/delivery/equivalence.
 - Declared-only enforcement/gaps are abstentions, not `400`-style errors.
 - OSS sample-repo flow only: local Java sources plus JSON manifest; not a
   production validation gate.

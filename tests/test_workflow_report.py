@@ -478,3 +478,579 @@ class TestSecretLedgerDedup:
         sync_manifest(manifest, db)
         third = report(db)
         assert len(third["contract_links"]) == 1
+
+
+# ---------------------------------------------------------------- backing liveness (additive, fail-closed)
+
+
+BK_SERVICE = APP_SERVICE
+BK_CONTROLLER_TMPL = """\
+package com.example.bk;
+
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RequestMapping("/api/bk")
+@RestController
+public class BkController {{
+
+    @PostMapping("/{route}")
+    public String handleBk() {{
+        return "ok";
+    }}
+}}
+"""
+
+BK_CLIENT_TMPL = """\
+package com.example.bk;
+
+import org.springframework.web.client.RestTemplate;
+
+public class BkClient {{
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    public String callBk() {{
+        String url = "http://bk.local/api/bk/{route}";
+        return restTemplate.postForObject(url, new Object(), String.class);
+    }}
+}}
+"""
+
+BK_OPENAPI_TMPL = """\
+openapi: 3.0.0
+info:
+  title: Bk
+  version: 1.0.0
+paths:
+  /api/bk/{route}:
+    post:
+      operationId: handleBk
+      responses:
+        '200':
+          description: ok
+"""
+
+
+def _write_bk_repo(base: Path, dirname: str, route: str) -> Path:
+    repo = base / dirname
+    repo.mkdir()
+    (repo / "BkService.java").write_text(BK_SERVICE, encoding="utf-8")
+    (repo / "BkController.java").write_text(
+        BK_CONTROLLER_TMPL.format(route=route), encoding="utf-8"
+    )
+    (repo / "BkClient.java").write_text(
+        BK_CLIENT_TMPL.format(route=route), encoding="utf-8"
+    )
+    (repo / "application.yml").write_text(APP_YAML, encoding="utf-8")
+    (repo / "openapi.yaml").write_text(
+        BK_OPENAPI_TMPL.format(route=route), encoding="utf-8"
+    )
+    return repo
+
+
+def _manifest_named(tmp_path: Path, *named_repos: tuple[str, Path]) -> Path:
+    manifest = tmp_path / "bk_repos.json"
+    manifest.write_text(
+        json.dumps(
+            {"repos": [{"name": n, "path": str(p)} for n, p in named_repos]}
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def _backings(data: dict) -> list[dict]:
+    return [a.get("backing") or {} for a in data["contract_links"]]
+
+
+class TestBackingActive:
+    def test_active_backing_ingest_no_changes(self, tmp_path):
+        repo = _write_bk_repo(tmp_path, "BkActiveRepo", "create")
+        manifest = _manifest_named(tmp_path, ("BkActive", repo))
+        db = tmp_path / "bk_active.db"
+        ingest_manifest(manifest, db)
+        data = report(db)
+        assert data["contract_links"], "expected contract links"
+        for entry in data["contract_links"]:
+            assert "backing" in entry, f"missing backing: {entry}"
+            backing = entry["backing"]
+            assert backing.get("status") == "active", backing
+            assert backing.get("reason")
+            # stored historical fields preserved
+            obj = entry["object"] if isinstance(entry.get("object"), dict) else {}
+            assert obj.get("compatible") is True
+            assert obj.get("destination_verified") is False
+            assert obj.get("equivalent") is False
+
+
+class TestBackingRenameReproB:
+    def test_route_rename_sync_original_stale_new_does_not_validate_old(
+        self, tmp_path
+    ):
+        repo = _write_bk_repo(tmp_path, "BkRenameRepo", "create")
+        manifest = _manifest_named(tmp_path, ("BkRename", repo))
+        db = tmp_path / "bk_rename.db"
+        ingest_manifest(manifest, db)
+        before = report(db)
+        assert any(
+            (a.get("backing") or {}).get("status") == "active"
+            for a in before["contract_links"]
+        )
+        old_objs = [
+            dict(a["object"]) for a in before["contract_links"]
+            if isinstance(a.get("object"), dict)
+        ]
+        # rename route: controller + openapi + client all move to renamed
+        (repo / "BkController.java").write_text(
+            BK_CONTROLLER_TMPL.format(route="renamed"), encoding="utf-8"
+        )
+        (repo / "openapi.yaml").write_text(
+            BK_OPENAPI_TMPL.format(route="renamed"), encoding="utf-8"
+        )
+        (repo / "BkClient.java").write_text(
+            BK_CLIENT_TMPL.format(route="renamed"), encoding="utf-8"
+        )
+        sync_manifest(manifest, db)
+        after = report(db)
+        # original links retained (no deletion)
+        assert len(after["contract_links"]) >= len(before["contract_links"])
+        # every link claiming the OLD path must not be active via the new route
+        for entry in after["contract_links"]:
+            obj = entry.get("object") or {}
+            if obj.get("openapi_path") == "/api/bk/create":
+                assert (entry.get("backing") or {}).get("status") != "active", entry
+        # at least one old-path link is now stale-or-missing
+        assert any(
+            (a.get("object") or {}).get("openapi_path") == "/api/bk/create"
+            and (a.get("backing") or {}).get("status") == "stale-or-missing"
+            for a in after["contract_links"]
+        ), after["contract_links"]
+        # historical compatible values unchanged for retained old links
+        for old in old_objs:
+            if old.get("openapi_path") == "/api/bk/create":
+                retained = [
+                    a for a in after["contract_links"]
+                    if isinstance(a.get("object"), dict)
+                    and a["object"].get("client_path") == old.get("client_path")
+                    and a["object"].get("openapi_path") == old.get("openapi_path")
+                ]
+                assert retained
+                for r in retained:
+                    assert r["object"].get("compatible") == old.get("compatible")
+                    assert r["object"].get("destination_verified") is False
+                    assert r["object"].get("equivalent") is False
+
+
+class TestBackingDeletion:
+    def test_route_deletion_sync_stale(self, tmp_path):
+        repo = _write_bk_repo(tmp_path, "BkDeleteRepo", "create")
+        manifest = _manifest_named(tmp_path, ("BkDelete", repo))
+        db = tmp_path / "bk_delete.db"
+        ingest_manifest(manifest, db)
+        assert any(
+            (a.get("backing") or {}).get("status") == "active"
+            for a in report(db)["contract_links"]
+        )
+        (repo / "BkController.java").unlink()
+        (repo / "openapi.yaml").unlink()
+        sync_manifest(manifest, db)
+        data = report(db)
+        assert data["contract_links"]
+        for entry in data["contract_links"]:
+            obj = entry.get("object") or {}
+            if obj.get("openapi_path") == "/api/bk/create":
+                assert (entry.get("backing") or {}).get("status") == (
+                    "stale-or-missing"
+                ), entry
+
+
+class TestBackingExplicitInvalidateReproC:
+    def test_invalidate_operation_stale_json_and_markdown(self, tmp_path):
+        from bo_ontology.store import OntologyStore as _Store
+
+        repo = _write_bk_repo(tmp_path, "BkInvalRepo", "create")
+        manifest = _manifest_named(tmp_path, ("BkInval", repo))
+        db = tmp_path / "bk_inval.db"
+        ingest_manifest(manifest, db)
+        data = report(db)
+        assert any(
+            (a.get("backing") or {}).get("status") == "active"
+            for a in data["contract_links"]
+        )
+        with _Store(str(db)) as store:
+            ops = store.all("operations")
+            assert ops, "expected operations"
+            # Deterministic: select the op backing the targeted link via
+            # the same repo+path+method identity the implementation uses
+            # (not ops[0], which assumes a single op).
+            link_obj = next(
+                (a.get("object") or {})
+                for a in data["contract_links"]
+                if isinstance(a.get("object"), dict)
+                and isinstance((a.get("object") or {}).get("operation_repo"), str)
+                and (a.get("object") or {}).get("operation_repo")
+                and isinstance((a.get("object") or {}).get("openapi_path"), str)
+                and (a.get("object") or {}).get("openapi_path")
+                and isinstance((a.get("object") or {}).get("operation_method"), str)
+                and (a.get("object") or {}).get("operation_method").strip()
+            )
+            want_repo = link_obj["operation_repo"]
+            want_path = link_obj["openapi_path"]
+            want_method = link_obj["operation_method"].strip().lower()
+
+            def _op_matches(row: dict) -> bool:
+                try:
+                    body = json.loads(row.get("description") or "{}")
+                except (TypeError, ValueError):
+                    return False
+                if not isinstance(body, dict):
+                    return False
+                prov = body.get("provenance") or {}
+                if not isinstance(prov, dict):
+                    return False
+                meths = [
+                    m.strip().lower()
+                    for m in (body.get("http_methods") or [])
+                    if isinstance(m, str) and m.strip()
+                ]
+                return (
+                    prov.get("repo") == want_repo
+                    and body.get("path") == want_path
+                    and meths == [want_method]
+                )
+
+            cands = [o for o in ops if _op_matches(o)]
+            assert cands, f"no op matches targeted link {link_obj}"
+            target = sorted(cands, key=lambda r: r["id"])[0]
+            op_id = target["id"]
+        invalidate_root(db, "operations", op_id, reason="bk explicit retire")
+        after = report(db)
+        assert after["contract_links"]
+        for entry in after["contract_links"]:
+            assert (entry.get("backing") or {}).get("status") == (
+                "stale-or-missing"
+            ), entry
+            assert (entry.get("backing") or {}).get("reason")
+        md = report_markdown(db)
+        assert "stale-or-missing" in md
+
+    def test_two_stale_candidates_join_triggers(self, tmp_path):
+        from bo_ontology.store import OntologyStore as _Store
+
+        # Two stale ops share one repo+path+method: joined triggers stay
+        # deterministic and complete (both causes cited, sorted).
+        repo = tmp_path / "BkJoinRepo"
+        repo.mkdir()
+        (repo / "BkService.java").write_text(BK_SERVICE, encoding="utf-8")
+        (repo / "BkControllerOne.java").write_text(
+            BK_CONTROLLER_TMPL.format(route="create").replace(
+                "BkController", "BkControllerOne"
+            ),
+            encoding="utf-8",
+        )
+        (repo / "BkControllerTwo.java").write_text(
+            BK_CONTROLLER_TMPL.format(route="create").replace(
+                "BkController", "BkControllerTwo"
+            ),
+            encoding="utf-8",
+        )
+        (repo / "BkClient.java").write_text(
+            BK_CLIENT_TMPL.format(route="create"), encoding="utf-8"
+        )
+        (repo / "application.yml").write_text(APP_YAML, encoding="utf-8")
+        (repo / "openapi.yaml").write_text(
+            BK_OPENAPI_TMPL.format(route="create"), encoding="utf-8"
+        )
+        manifest = _manifest_named(tmp_path, ("BkJoin", repo))
+        db = tmp_path / "bk_join.db"
+        ingest_manifest(manifest, db)
+        with _Store(str(db)) as store:
+            ops = sorted(store.all("operations"), key=lambda r: r["id"])
+            assert len(ops) >= 2, "expected two ops same route"
+            targets = ops[:2]
+        invalidate_root(
+            db, "operations", targets[0]["id"], reason="bk retire one"
+        )
+        invalidate_root(
+            db, "operations", targets[1]["id"], reason="bk retire two"
+        )
+        data = report(db)
+        assert data["contract_links"]
+        for entry in data["contract_links"]:
+            reason = (entry.get("backing") or {}).get("reason") or ""
+            assert (entry.get("backing") or {}).get("status") == (
+                "stale-or-missing"
+            ), entry
+            assert "bk retire one" in reason, reason
+            assert "bk retire two" in reason, reason
+
+
+class TestBackingCrossRepoDuplicate:
+    def test_same_route_other_repo_does_not_rescue(self, tmp_path):
+        repo_a = _write_bk_repo(tmp_path, "BkDupARepo", "create")
+        repo_b = _write_bk_repo(tmp_path, "BkDupBRepo", "create")
+        web = tmp_path / "BkDupWebRepo"
+        web.mkdir()
+        (web / "BkClient.java").write_text(
+            BK_CLIENT_TMPL.format(route="create"), encoding="utf-8"
+        )
+        (web / "application.yml").write_text(APP_YAML, encoding="utf-8")
+        manifest = _manifest_named(
+            tmp_path,
+            ("BkDupA", repo_a),
+            ("BkDupB", repo_b),
+            ("BkDupWeb", web),
+        )
+        db = tmp_path / "bk_dup.db"
+        ingest_manifest(manifest, db)
+        before = report(db)
+        assert before["contract_links"]
+        # pin: find links whose backing points at BkDupA
+        from bo_ontology.store import OntologyStore as _Store
+
+        with _Store(str(db)) as store:
+            ops = store.all("operations")
+            op_a = next(o for o in ops if "BkDupA" in (o.get("name") or ""))
+            op_a_id = op_a["id"]
+        invalidate_root(db, "operations", op_a_id, reason="retire BkDupA route")
+        after = report(db)
+        # links pinned to BkDupA must be stale even though BkDupB identical active
+        pinned_stale = [
+            a for a in after["contract_links"]
+            if isinstance(a.get("object"), dict)
+            and a["object"].get("operation_repo") == "BkDupA"
+        ]
+        assert pinned_stale, after["contract_links"]
+        for entry in pinned_stale:
+            assert (entry.get("backing") or {}).get("status") == (
+                "stale-or-missing"
+            ), entry
+
+
+class TestBackingReplacementNoTransfer:
+    def test_replacement_only_backs_matching_links_reviews_not_transferred(
+        self, tmp_path
+    ):
+        repo = _write_bk_repo(tmp_path, "BkReplRepo", "create")
+        manifest = _manifest_named(tmp_path, ("BkRepl", repo))
+        db = tmp_path / "bk_repl.db"
+        ingest_manifest(manifest, db)
+        before = report(db)
+        old_link = next(
+            a for a in before["contract_links"]
+            if (a.get("object") or {}).get("openapi_path") == "/api/bk/create"
+        )
+        old_obj = dict(old_link["object"])
+        record_review(
+            db, "BkRepl:windowDays", reviewer="qa", reason="old review intact"
+        )
+        # rename route + repoint client (replacement same repo+method new path)
+        (repo / "BkController.java").write_text(
+            BK_CONTROLLER_TMPL.format(route="renamed"), encoding="utf-8"
+        )
+        (repo / "openapi.yaml").write_text(
+            BK_OPENAPI_TMPL.format(route="renamed"), encoding="utf-8"
+        )
+        (repo / "BkClient.java").write_text(
+            BK_CLIENT_TMPL.format(route="renamed"), encoding="utf-8"
+        )
+        sync_manifest(manifest, db)
+        after = report(db)
+        # old link retained but stale (no validity transfer via replacement)
+        old_retained = [
+            a for a in after["contract_links"]
+            if isinstance(a.get("object"), dict)
+            and a["object"].get("openapi_path") == "/api/bk/create"
+        ]
+        assert old_retained
+        for entry in old_retained:
+            assert (entry.get("backing") or {}).get("status") == (
+                "stale-or-missing"
+            ), entry
+            assert entry["object"].get("compatible") == old_obj.get("compatible")
+        # replacement's own new links (re-pointed client) are separate rows
+        new_links = [
+            a for a in after["contract_links"]
+            if isinstance(a.get("object"), dict)
+            and a["object"].get("openapi_path") == "/api/bk/renamed"
+        ]
+        assert new_links, "expected new links for re-pointed client"
+        # human reviews never transfer to new subjects
+        assert after["reviews"]
+        assert all(
+            r.get("subject") != "BkRepl:renamed-route" for r in after["reviews"]
+        )
+        from bo_ontology.store import OntologyStore as _Store
+
+        with _Store(str(db)) as store:
+            assert store.reviews("BkRepl:renamed-route") == []
+            assert store.reviews("BkRepl:windowDays")
+
+
+class TestBackingMissingAmbiguousFailClosed:
+    def test_missing_identity_fails_closed(self, tmp_path):
+        from bo_ontology import schema as _schema
+        from bo_ontology.store import OntologyStore as _Store
+
+        repo = _write_bk_repo(tmp_path, "BkMissRepo", "create")
+        manifest = _manifest_named(tmp_path, ("BkMiss", repo))
+        db = tmp_path / "bk_miss.db"
+        ingest_manifest(manifest, db)
+        with _Store(str(db)) as store:
+            store.add_assertion(
+                _schema.Assertion(
+                    subject="link:legacy:/api/bk/create:9",
+                    predicate=CONTRACT_LINK,
+                    object={
+                        "client_path": "/api/bk/create",
+                        "openapi_path": "/api/bk/create",
+                        "compatible": True,
+                        "equivalent": False,
+                        "destination_verified": False,
+                        "reason": "legacy without operation ref",
+                    },
+                )
+            )
+        data = report(db)
+        legacy = [
+            a for a in data["contract_links"]
+            if a.get("subject") == "link:legacy:/api/bk/create:9"
+        ]
+        assert legacy, "legacy link must be retained"
+        backing = legacy[0].get("backing") or {}
+        assert backing.get("status") == "stale-or-missing", backing
+        assert backing.get("reason")
+
+    def test_ambiguous_duplicate_same_repo_fails_closed(self, tmp_path):
+        repo = tmp_path / "BkAmbigRepo"
+        repo.mkdir()
+        (repo / "BkService.java").write_text(BK_SERVICE, encoding="utf-8")
+        # two controllers same repo same path+method (different files)
+        (repo / "BkControllerOne.java").write_text(
+            BK_CONTROLLER_TMPL.format(route="create").replace(
+                "BkController", "BkControllerOne"
+            ),
+            encoding="utf-8",
+        )
+        (repo / "BkControllerTwo.java").write_text(
+            BK_CONTROLLER_TMPL.format(route="create").replace(
+                "BkController", "BkControllerTwo"
+            ),
+            encoding="utf-8",
+        )
+        (repo / "BkClient.java").write_text(
+            BK_CLIENT_TMPL.format(route="create"), encoding="utf-8"
+        )
+        (repo / "application.yml").write_text(APP_YAML, encoding="utf-8")
+        (repo / "openapi.yaml").write_text(
+            BK_OPENAPI_TMPL.format(route="create"), encoding="utf-8"
+        )
+        manifest = _manifest_named(tmp_path, ("BkAmbig", repo))
+        db = tmp_path / "bk_ambig.db"
+        ingest_manifest(manifest, db)
+        data = report(db)
+        assert len(data["contract_links"]) >= 1
+        # with two active ops same repo+path+method, pinned links are ambiguous
+        assert any(
+            (a.get("backing") or {}).get("status") == "stale-or-missing"
+            and "ambiguous" in ((a.get("backing") or {}).get("reason") or "")
+            for a in data["contract_links"]
+        ), [a.get("backing") for a in data["contract_links"]]
+
+    def test_redacted_identity_fails_closed_distinct(self, tmp_path):
+        from bo_ontology import schema as _schema
+        from bo_ontology.store import OntologyStore as _Store
+
+        secret_path = "/api/sk-test-secret-abc12345"
+        repo = _write_bk_repo(tmp_path, "BkRedactRepo", "create")
+        manifest = _manifest_named(tmp_path, ("BkRedact", repo))
+        db = tmp_path / "bk_redact.db"
+        ingest_manifest(manifest, db)
+        with _Store(str(db)) as store:
+            store.add_assertion(
+                _schema.Assertion(
+                    subject="link:legacy-secret:/api/bk/create:9",
+                    predicate=CONTRACT_LINK,
+                    object={
+                        "client_path": secret_path,
+                        "openapi_path": secret_path,
+                        "operation_repo": "BkRedact",
+                        "operation_method": "post",
+                        "compatible": True,
+                        "equivalent": False,
+                        "destination_verified": False,
+                        "reason": "secret-shaped path link",
+                    },
+                )
+            )
+        data = report(db)
+        legacy = [
+            a for a in data["contract_links"]
+            if a.get("subject") == "link:legacy-secret:/api/bk/create:9"
+        ]
+        assert legacy, "secret-shaped link must be retained"
+        backing = legacy[0].get("backing") or {}
+        assert backing.get("status") == "stale-or-missing", backing
+        reason = backing.get("reason") or ""
+        assert "redacted operation identity" in reason, reason
+        assert "fail closed" in reason, reason
+        assert "missing operation identity" not in reason, reason
+        assert "sk-test-secret" not in reason, reason
+        md = report_markdown(db)
+        assert "sk-test-secret" not in md
+        assert "redacted operation identity" in md
+
+
+class TestBackingCountsDeterministicFields:
+    def test_counts_agree_deterministic_fields_preserved(self, tmp_path):
+        repo = _write_bk_repo(tmp_path, "BkCountRepo", "create")
+        manifest = _manifest_named(tmp_path, ("BkCount", repo))
+        db = tmp_path / "bk_count.db"
+        ingest_manifest(manifest, db)
+        first = report(db)
+        second = report(db)
+        assert first["counts"]["contract_links"] == len(first["contract_links"])
+        assert second["counts"]["contract_links"] == len(second["contract_links"])
+        # deterministic modulo db path (same db -> byte-identical sans db key)
+        assert json.dumps(first, sort_keys=True, default=str) == json.dumps(
+            second, sort_keys=True, default=str
+        )
+        md_first = report_markdown(db)
+        md_second = report_markdown(db)
+        assert md_first == md_second
+        # Markdown shows backing explicitly on every link row
+        assert "Backing" in md_first
+        assert "stale-or-missing" in md_first or "active" in md_first
+        # Per-row: every contract-link table row carries a non-empty
+        # Backing cell (counts stable: one row per link).
+        section = md_first.split("## Cross-Repo Contract Links", 1)[1]
+        tail = section.split("\n## ", 1)[0]
+        table_lines = [ln for ln in tail.splitlines() if ln.startswith("| ")]
+        assert len(table_lines) >= 2, table_lines
+        header = [
+            h.strip() for h in table_lines[0].strip().strip("|").split("|")
+        ]
+        assert header[-1] == "Backing", header
+        body_rows = table_lines[2:]
+        assert len(body_rows) == len(first["contract_links"]), (
+            len(body_rows),
+            len(first["contract_links"]),
+        )
+        for row in body_rows:
+            inner = row.strip().strip("|").replace("\\|", "\x00")
+            cells = [c.strip().replace("\x00", "\\|") for c in inner.split("|")]
+            assert len(cells) == len(header) == 7, row
+            backing_cell = cells[-1]
+            assert backing_cell, row
+            assert (
+                "active" in backing_cell or "stale-or-missing" in backing_cell
+            ), row
+        # prior JSON fields retain values
+        for entry in first["contract_links"]:
+            obj = entry.get("object") or {}
+            assert "compatible" in obj
+            assert "destination_verified" in obj
+            assert "equivalent" in obj
+

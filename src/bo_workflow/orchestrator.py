@@ -337,7 +337,15 @@ def _operation_record(
 
 
 def _contract_assertion(link: dict[str, Any]) -> schema.Assertion:
-    """Build the stored contract-link assertion for one resolved link."""
+    """Build the stored contract-link assertion for one resolved link.
+
+    Persists operation-side identity (repo+path+method) for backing liveness:
+    ``openapi_file``/``openapi_line`` (raw op file/line), ``annotation_file``/
+    ``annotation_line``/``source`` when annotation-backed, plus normalized
+    ``operation_method`` (lowercased op verb) and ``operation_repo`` (manifest
+    repo containing the op file, no name guessing). Historical fields stay
+    byte-identical; these are additive for fail-closed backing.
+    """
     provenance = _provenance("cross-repo", link, "bo_workflow.contract_link")
     payload = {
         "client_url": link.get("client_url"),
@@ -351,6 +359,15 @@ def _contract_assertion(link: dict[str, Any]) -> schema.Assertion:
         "method_reason": link.get("method_reason"),
         "default_method": link.get("default_method", False),
         "provenance": provenance,
+        # Operation-side identity (structured, no display-name parsing):
+        # file/line pin the declaration; repo+path+method is the backing key.
+        "openapi_file": link.get("openapi_file"),
+        "openapi_line": link.get("openapi_line"),
+        "annotation_file": link.get("annotation_file"),
+        "annotation_line": link.get("annotation_line"),
+        "source": link.get("source"),
+        "operation_method": link.get("operation_method"),
+        "operation_repo": link.get("operation_repo"),
     }
     return schema.Assertion(
         subject=f"link:{link.get('client_path')}"
@@ -735,6 +752,70 @@ def _compute_links(aggregate: dict[str, Any]) -> list[dict[str, Any]]:
     return links
 
 
+def _repo_for_file(
+    repo_paths: dict[str, str], file: str | None
+) -> str | None:
+    """Manifest repo containing ``file`` (structured prefix, no guessing).
+
+    Exact containment via ``Path.relative_to``; None when missing or when
+    more than one repo contains the file (ambiguous, fail closed).
+    Note: nested manifest repos (one repo path containing another) are
+    ambiguous containment by construction -- a file under the inner repo
+    matches both -- so they resolve to None (unsupported by contract,
+    fail closed downstream).
+    """
+    if not file:
+        return None
+    hits: list[str] = []
+    for name, base in (repo_paths or {}).items():
+        try:
+            Path(str(file)).relative_to(base)
+        except ValueError:
+            continue
+        else:
+            hits.append(name)
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _enrich_link_identity(
+    link: dict[str, Any],
+    openapi_ops: list[dict[str, Any]],
+    annotation_ops: list[dict[str, Any]],
+    repo_paths: dict[str, str],
+) -> None:
+    """Fill ``operation_repo``/``operation_method`` on a raw link (in place).
+
+    Uses ONLY structured fields: op file/line/path equality (no display-name
+    parsing, no repo guessing, no route-alone matching). Annotation-backed
+    links (``annotation_file`` present / ``source == spring_annotation``)
+    resolve against annotation ops; otherwise against openapi ops. Missing or
+    non-unique op records leave the fields None (fail closed downstream).
+    """
+    op_path = link.get("openapi_path")
+    op_file = link.get("openapi_file")
+    op_line = link.get("openapi_line")
+    is_annotation = bool(link.get("annotation_file")) or link.get(
+        "source"
+    ) == "spring_annotation"
+    pool = annotation_ops if is_annotation else openapi_ops
+    method: str | None = None
+    if isinstance(op_path, str) and op_path and op_file and op_line is not None:
+        cands = [
+            op for op in pool
+            if op.get("file") == op_file
+            and op.get("line") == op_line
+            and op.get("openapi_path") == op_path
+        ]
+        if len(cands) == 1:
+            raw_m = cands[0].get("method")
+            if isinstance(raw_m, str) and raw_m.strip():
+                method = raw_m.strip().lower()
+    link["operation_method"] = method
+    link["operation_repo"] = _repo_for_file(repo_paths, str(op_file or ""))
+
+
 def _collect_binding_abstentions(aggregate: dict[str, Any]) -> None:
     """Append unresolved operation-binding abstentions (per repo, in order)."""
     for repo_name, (openapi_ops, interfaces, implementations) in aggregate[
@@ -760,7 +841,9 @@ def _collect_binding_abstentions(aggregate: dict[str, Any]) -> None:
 
 
 def _link_contracts(
-    store: OntologyStore, aggregate: dict[str, Any]
+    store: OntologyStore,
+    aggregate: dict[str, Any],
+    repo_paths: dict[str, str] | None = None,
 ) -> None:
     """Cross-repo declared-only links; unverified ones become abstentions."""
     links = _compute_links(aggregate)
@@ -770,6 +853,12 @@ def _link_contracts(
     )
 
     for link in links:
+        _enrich_link_identity(
+            link,
+            aggregate.get("openapi") or [],
+            aggregate.get("annotation_operations") or [],
+            repo_paths or {},
+        )
         store.add_assertion(_contract_assertion(link))
         aggregate["counts"]["assertions"] += 1
         if link.get("compatible") is not True:
@@ -860,7 +949,9 @@ def ingest_manifest(
             _persist_repo(store, repo["name"], repo["path"], aggregate)
         _collect_binding_abstentions(aggregate)
         _link_dependencies(store, aggregate)
-        _link_contracts(store, aggregate)
+        _link_contracts(
+            store, aggregate, {r["name"]: r["path"] for r in repos}
+        )
         _persist_ledger(store, aggregate)
 
     summary = {
@@ -1753,6 +1844,12 @@ def sync_manifest(
             tuple[schema.Assertion, tuple | None, tuple | None]
         ] = []
         for link in fresh_links:
+            _enrich_link_identity(
+                link,
+                aggregate.get("openapi") or [],
+                aggregate.get("annotation_operations") or [],
+                repo_paths,
+            )
             assertion = _contract_assertion(link)
             key, nofile = _ledger_key(CONTRACT_LINK, link, repo_paths)
             fresh_assertions.append((assertion, key, nofile))
@@ -1968,6 +2065,210 @@ def _claim_provenance(kind: str, row: dict[str, Any]) -> dict[str, Any] | None:
     return fallback
 
 
+def _operation_backing_index(
+    store: OntologyStore, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Parsed operations for backing: repo+path+single-method (structured).
+
+    Backing key tuple is ``(operation_repo, openapi_path, operation_method)``:
+    repo from stored operation provenance (no display-name parsing, no repo
+    guessing), path from stored description ``path`` (exact route identity,
+    no template guessing beyond stored equality), method lowercased from
+    stored ``http_methods`` (single-method exact; multi-method/unlinkable
+    rows never match a single-verb link). File/line are audit-only (stored
+    for explanation; line shifts and intra-repo file moves keep the same
+    key on purpose). Active = ``_is_active_row`` (status != stale; for
+    status-less kinds consult invalidate history), consistent with the
+    active/stale partition.
+    """
+    parsed: list[dict[str, Any]] = []
+    for row in rows:
+        body = _as_json(row.get("description"))
+        if not isinstance(body, dict):
+            continue
+        prov = body.get("provenance")
+        if not isinstance(prov, dict):
+            continue
+        repo = prov.get("repo")
+        path = body.get("path")
+        raw_methods = body.get("http_methods")
+        methods: list[str] = []
+        if isinstance(raw_methods, list):
+            for m in raw_methods:
+                if isinstance(m, str) and m.strip():
+                    methods.append(m.strip().lower())
+        # file/line audit-only
+        op_file = str(prov.get("file") or "")
+        try:
+            op_line = int(prov.get("line", 1))
+        except (TypeError, ValueError):
+            op_line = 1
+        is_active = _is_active_row(store, "operations", row)
+        trigger: str | None = None
+        if not is_active:
+            hist = [
+                e for e in store.history("operations", row.get("id"))
+                if e.get("action") == "invalidate"
+            ]
+            if hist:
+                trigger = _detail_reason(hist[-1])
+        parsed.append(
+            {
+                "id": row.get("id"),
+                "repo": repo,
+                "path": path,
+                "methods": methods,
+                "file": op_file,
+                "line": op_line,
+                "is_active": is_active,
+                "trigger": trigger,
+            }
+        )
+    return parsed
+
+
+def _backing_for_link(
+    obj: dict[str, Any], ops: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Additive backing liveness for one contract link (fail closed).
+
+    Active = exactly one *currently active* operation matches
+    ``(operation_repo, openapi_path, operation_method)`` with single-method
+    equality. Everything else is ``stale-or-missing`` with a cause:
+    missing/unresolvable identity, ambiguous N candidates, backing
+    invalidated (with trigger when known), or no active backing operation
+    found (source removed or never ingested).
+
+    Historical ``compatible``/``equivalent``/``destination_verified`` are
+    untouched: active backing alone does NOT establish client-source
+    freshness, destination verification, equivalence, or delivery (those
+    remain false/unverified; compatibility is the historical contract-match
+    result, not current support).
+
+    Redacted operation identity (any of repo/path/method is ``[REDACTED]``)
+    is permanent fail-closed by intent: redaction is one-way, so backing
+    never rescues via the raw secret. Frozen/seal verification (if any) is
+    left to the commit step, not to backing liveness.
+    """
+    repo = obj.get("operation_repo")
+    path = obj.get("openapi_path")
+    method_raw = obj.get("operation_method")
+    if (
+        repo == "[REDACTED]"
+        or path == "[REDACTED]"
+        or (isinstance(method_raw, str) and method_raw.strip() == "[REDACTED]")
+    ):
+        return {
+            "status": "stale-or-missing",
+            "reason": (
+                "redacted operation identity (fail closed: secret-shaped "
+                "operation ref redacted to [REDACTED]; permanent "
+                "stale-or-missing, no cleartext retained)"
+            ),
+        }
+    if (
+        not isinstance(repo, str)
+        or not repo
+        or not isinstance(path, str)
+        or not path
+        or not isinstance(method_raw, str)
+        or not method_raw.strip()
+    ):
+        return {
+            "status": "stale-or-missing",
+            "reason": (
+                "missing operation identity (unresolvable/missing "
+                "operation ref: need operation_repo+openapi_path+"
+                "operation_method; fail closed)"
+            ),
+        }
+    method = method_raw.strip().lower()
+    matching_active = [
+        o for o in ops
+        if o.get("is_active")
+        and o.get("repo") == repo
+        and o.get("path") == path
+        and isinstance(o.get("methods"), list)
+        and len(o["methods"]) == 1
+        and o["methods"][0] == method
+    ]
+    if len(matching_active) == 1:
+        hit = matching_active[0]
+        return {
+            "status": "active",
+            "reason": (
+                f"active backing: exactly one active operation matches "
+                f"{repo}+{path}+{method} (operation {hit.get('id')} "
+                f"{repo}:{hit.get('file')}:L{hit.get('line')}); "
+                f"compatible stays historical (not current support, "
+                f"not delivery/destination/equivalence proof)"
+            ),
+            "operation_id": hit.get("id"),
+            "operation_file": hit.get("file"),
+            "operation_line": hit.get("line"),
+        }
+    if len(matching_active) > 1:
+        return {
+            "status": "stale-or-missing",
+            "reason": (
+                f"ambiguous {len(matching_active)} candidates "
+                f"(multiple active operations match {repo}+{path}+"
+                f"{method}; fail closed)"
+            ),
+        }
+    # zero active: distinguish invalidated vs removed vs never-ingested
+    matching_all = [
+        o for o in ops
+        if o.get("repo") == repo
+        and o.get("path") == path
+        and isinstance(o.get("methods"), list)
+        and len(o["methods"]) == 1
+        and o["methods"][0] == method
+    ]
+    if matching_all:
+        # Deterministic + complete: join unique non-empty triggers sorted.
+        # (Smallest-alone could cite the wrong trigger with >1 stale
+        # candidates; the join preserves every cause deterministically.)
+        triggers = sorted(
+            {
+                str(o.get("trigger") or "")
+                for o in matching_all
+                if str(o.get("trigger") or "")
+            }
+        )
+        trig = "; ".join(triggers)
+        if trig and "removed" in trig.lower():
+            return {
+                "status": "stale-or-missing",
+                "reason": (
+                    f"source record removed: no active backing operation "
+                    f"for {repo}+{path}+{method} ({trig})"
+                ),
+            }
+        if trig:
+            return {
+                "status": "stale-or-missing",
+                "reason": (
+                    f"backing invalidated ({trig}): no active backing "
+                    f"operation for {repo}+{path}+{method}"
+                ),
+            }
+        return {
+            "status": "stale-or-missing",
+            "reason": (
+                f"backing invalidated (no active backing operation for "
+                f"{repo}+{path}+{method}; historical match all stale)"
+            ),
+        }
+    return {
+        "status": "stale-or-missing",
+        "reason": (
+            f"no active backing operation found for {repo}+{path}+"
+            f"{method} (source record removed or never ingested)"
+        ),
+    }
+
+
 def report(db_path: str | Path) -> dict[str, Any]:
     """Inspect the unified store: active/stale claims, ledger, reviews."""
     with OntologyStore(str(db_path)) as store:
@@ -2010,6 +2311,19 @@ def report(db_path: str | Path) -> dict[str, Any]:
         )
         gaps = [a for a in ledger if a.get("predicate") == GAP]
         links = [a for a in ledger if a.get("predicate") == CONTRACT_LINK]
+        # Additive backing liveness (no re-audit, no deletion, no stored
+        # mutation): every contract link keeps all existing fields
+        # byte-identical and gains only a top-level ``backing`` key.
+        ops_index = _operation_backing_index(
+            store, store.all("operations")
+        )
+        for entry in links:
+            obj = entry.get("object")
+            if not isinstance(obj, dict):
+                obj = _as_json(obj) or {}
+                if not isinstance(obj, dict):
+                    obj = {}
+            entry["backing"] = _backing_for_link(obj, ops_index)
         reviews = store.reviews()
         counts = {
             "active": len(active),
@@ -2131,7 +2445,10 @@ def report_markdown(db_path: str | Path) -> str:
     ``source provenance unavailable``); names retain file/line hints where
     available (params show ``repo:key``, transitions show target).
     Contract links are declared-only (``destination_verified`` always false,
-    ``equivalent`` never true).
+    ``equivalent`` never true). Every contract-link row carries an explicit
+    ``Backing`` column (``active`` vs ``stale-or-missing`` + reason) so the
+    current backing liveness is readable alongside the historical
+    compatibility result (compatible != currently supported).
     """
     data = report(db_path)
     db_cell = _md_cell(data["db"]).replace("`", "\\`")
@@ -2211,7 +2528,11 @@ def report_markdown(db_path: str | Path) -> str:
     lines.append("")
     lines.append(
         "All links are declared-only: `destination_verified` is always "
-        "false and `equivalent` is never true."
+        "false and `equivalent` is never true. `Compatible` is the "
+        "historical contract-match result; `Backing` is the current "
+        "liveness (`active` means exactly one active operation matches "
+        "repo+path+method, otherwise `stale-or-missing` with a cause; "
+        "active backing alone proves no freshness/delivery/equivalence)."
     )
     lines.append("")
     link_rows: list[list[str]] = []
@@ -2220,6 +2541,12 @@ def report_markdown(db_path: str | Path) -> str:
         key=lambda a: str(a.get("subject")),
     ):
         obj = _md_object(link.get("object"))
+        backing = link.get("backing") or {}
+        b_status = str(backing.get("status") or "stale-or-missing")
+        b_reason = str(backing.get("reason") or "")
+        backing_cell = _md_cell(b_status)
+        if b_reason:
+            backing_cell += "<br/>" + _md_cell(b_reason)
         link_rows.append(
             [
                 _md_cell(obj.get("client_path") or obj.get("client_url")),
@@ -2228,6 +2555,7 @@ def report_markdown(db_path: str | Path) -> str:
                 _md_bool(obj.get("equivalent", False)),
                 _md_bool(obj.get("destination_verified", False)),
                 _md_cell(obj.get("reason")),
+                backing_cell,
             ]
         )
     lines.extend(
@@ -2239,6 +2567,7 @@ def report_markdown(db_path: str | Path) -> str:
                 "Equivalent",
                 "Destination Verified",
                 "Reason",
+                "Backing",
             ],
             link_rows,
         )
