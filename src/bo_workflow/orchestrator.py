@@ -1754,18 +1754,8 @@ def sync_manifest(
         ] = []
         for link in fresh_links:
             assertion = _contract_assertion(link)
-            fresh_assertions.append(
-                (
-                    assertion,
-                    (
-                        "contract_link",
-                        link.get("client_path"),
-                        link.get("openapi_path"),
-                        bool(link.get("compatible")),
-                    ),
-                    None,
-                )
-            )
+            key, nofile = _ledger_key(CONTRACT_LINK, link, repo_paths)
+            fresh_assertions.append((assertion, key, nofile))
         seq = 0
         for entry in aggregate["abstentions"]:
             if entry["kind"] == "unverified_link":
@@ -1896,6 +1886,88 @@ def _detail_reason(entry: dict[str, Any]) -> str | None:
     return None
 
 
+def _provenance_from_evidence(ev: Any) -> dict[str, Any] | None:
+    """Normalize one evidence item to provenance shape (no name parsing)."""
+    if ev is None:
+        return None
+    if isinstance(ev, dict):
+        repo = ev.get("repo")
+        path = ev.get("path", ev.get("file", ""))
+        start = ev.get("line_start", ev.get("line", ev.get("start_line")))
+        end = ev.get("line_end", ev.get("end_line", start))
+    else:
+        repo = getattr(ev, "repo", None)
+        path = getattr(ev, "path", getattr(ev, "file", ""))
+        start = getattr(ev, "line_start", getattr(ev, "line", None))
+        end = getattr(ev, "line_end", start)
+    if not repo:
+        return None
+    try:
+        start_i = int(start) if start is not None else 1
+    except (TypeError, ValueError):
+        return None
+    try:
+        end_i = int(end) if end is not None else start_i
+    except (TypeError, ValueError):
+        end_i = start_i
+    return {
+        "repo": repo,
+        "file": str(path or ""),
+        "line": start_i,
+        "span": {"start_line": start_i, "end_line": end_i},
+    }
+
+
+def _claim_provenance(kind: str, row: dict[str, Any]) -> dict[str, Any] | None:
+    """Explicit stored provenance for one claim row (nullable, additive).
+
+    Sourced without parsing display names: rules from ``supporting[0]``,
+    transitions from trigger-JSON ``provenance``, operations from
+    description-JSON ``provenance``, params from description-JSON; every
+    kind falls back to ``evidence[0]``. Returns ``None`` when no stored
+    provenance is found.
+
+    ``evidence`` needs no ``_as_json``: ``store.all`` already JSON-decodes
+    it (``evidence`` is in ``_JSON_COLUMNS``), so direct list/dict handling
+    is safe; a stray string falls through to ``None`` (unavailable).
+    """
+    evidence = row.get("evidence")
+    fallback: dict[str, Any] | None = None
+    if isinstance(evidence, list) and evidence:
+        fallback = _provenance_from_evidence(evidence[0])
+    elif isinstance(evidence, dict):
+        fallback = _provenance_from_evidence(evidence)
+    if kind == "rules":
+        supporting = _as_json(row.get("supporting"))
+        if isinstance(supporting, list) and supporting:
+            first = supporting[0]
+            if isinstance(first, dict) and first.get("repo"):
+                return first
+        elif isinstance(supporting, dict) and supporting.get("repo"):
+            return supporting
+        return fallback
+    if kind == "transitions":
+        trigger = _as_json(row.get("trigger"))
+        if isinstance(trigger, dict):
+            prov = trigger.get("provenance")
+            if isinstance(prov, dict) and prov.get("repo"):
+                return prov
+        return fallback
+    if kind == "operations":
+        body = _as_json(row.get("description"))
+        if isinstance(body, dict):
+            prov = body.get("provenance")
+            if isinstance(prov, dict) and prov.get("repo"):
+                return prov
+        return fallback
+    if kind == "params":
+        desc = _as_json(row.get("description"))
+        if isinstance(desc, dict) and desc.get("repo"):
+            return desc
+        return fallback
+    return fallback
+
+
 def report(db_path: str | Path) -> dict[str, Any]:
     """Inspect the unified store: active/stale claims, ledger, reviews."""
     with OntologyStore(str(db_path)) as store:
@@ -1912,6 +1984,7 @@ def report(db_path: str | Path) -> dict[str, Any]:
                     "id": row.get("id"),
                     "name": label,
                     "status": row.get("status"),
+                    "provenance": _claim_provenance(kind, row),
                 }
                 invalidates = [
                     e for e in store.history(kind, row.get("id"))
@@ -2014,6 +2087,29 @@ def _md_bool(value: Any) -> str:
     return _md_cell(value)
 
 
+def _md_provenance(prov: Any) -> str:
+    """Render explicit provenance or the unavailable label (redaction-safe)."""
+    if not isinstance(prov, dict) or not prov.get("repo"):
+        return _md_cell("source provenance unavailable")
+    repo = str(prov.get("repo", ""))
+    path = str(prov.get("file", prov.get("path", "")) or "")
+    span = prov.get("span") if isinstance(prov.get("span"), dict) else None
+    if span is not None:
+        try:
+            start = int(span.get("start_line", prov.get("line", 1)))
+        except (TypeError, ValueError):
+            start = prov.get("line", 1)
+        try:
+            end = int(span.get("end_line", start))
+        except (TypeError, ValueError):
+            end = start
+        lines = f"L{start}-L{end}"
+    else:
+        line = prov.get('line', prov.get('line_start', 1))
+        lines = f"L{line}-L{line}"
+    return _md_cell(f"{repo}:{path}:{lines}")
+
+
 def _md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     """Render one Markdown table (or ``None`` when there are no rows)."""
     if not rows:
@@ -2030,10 +2126,11 @@ def report_markdown(db_path: str | Path) -> str:
     """Render ``report(db_path)`` as deterministic Markdown (pure readout).
 
     No timestamps: sections are sorted by ``(kind, id)`` / subject so two
-    runs over the same store are byte-identical. Rules/operations carry
-    file/line provenance (``<repo>:<path>:L<line>:...``); params show
-    ``repo:key`` and transitions show target. Contract links are
-    declared-only (``destination_verified`` always false,
+    runs over the same store are byte-identical. Active/Stale carry an
+    explicit Provenance column (``<repo>:<path>:L<start>-L<end>`` or
+    ``source provenance unavailable``); names retain file/line hints where
+    available (params show ``repo:key``, transitions show target).
+    Contract links are declared-only (``destination_verified`` always false,
     ``equivalent`` never true).
     """
     data = report(db_path)
@@ -2056,8 +2153,10 @@ def report_markdown(db_path: str | Path) -> str:
     lines.append("## Active Claims")
     lines.append("")
     lines.append(
-        "Rules/operations carry file/line provenance "
-        "(`<repo>:<path>:L<line>:...`); params show `repo:key`, "
+        "Explicit provenance is shown in the Provenance column "
+        "(`<repo>:<file>:L<start>-L<end>`); `source provenance unavailable` "
+        "means no stored provenance was found. Names still carry file/line "
+        "hints where available; params show `repo:key`, "
         "transitions show target."
     )
     lines.append("")
@@ -2072,12 +2171,13 @@ def report_markdown(db_path: str | Path) -> str:
         lines.append("")
         lines.extend(
             _md_table(
-                ["ID", "Name", "Status"],
+                ["ID", "Name", "Status", "Provenance"],
                 [
                     [
                         _md_cell(e["id"]),
                         _md_cell(e["name"]),
                         _md_cell(e["status"]),
+                        _md_provenance(e.get("provenance")),
                     ]
                     for e in by_kind[kind]
                 ],
@@ -2089,7 +2189,7 @@ def report_markdown(db_path: str | Path) -> str:
     lines.append("")
     lines.extend(
         _md_table(
-            ["Kind", "ID", "Name", "Status", "Trigger"],
+            ["Kind", "ID", "Name", "Status", "Trigger", "Provenance"],
             [
                 [
                     _md_cell(e["kind"]),
@@ -2097,6 +2197,7 @@ def report_markdown(db_path: str | Path) -> str:
                     _md_cell(e["name"]),
                     _md_cell(e["status"]),
                     _md_cell(e.get("trigger")),
+                    _md_provenance(e.get("provenance")),
                 ]
                 for e in sorted(
                     data["stale"], key=lambda e: (e["kind"], e["id"])

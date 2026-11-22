@@ -15,12 +15,16 @@ import sys
 from pathlib import Path
 
 from bo_workflow.orchestrator import (
+    CONTRACT_LINK,
+    _ledger_key,
     _md_cell,
+    _md_provenance,
     ingest_manifest,
     invalidate_root,
     record_review,
     report,
     report_markdown,
+    sync_manifest,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -295,3 +299,182 @@ class TestEmptyStore:
             assert section in md
         assert "None" in md
         assert "| active | 0 |" in md
+
+
+def _md_section_table_data_rows(md: str, start: str, end: str | None) -> list[str]:
+    inside = False
+    rows: list[str] = []
+    for line in md.splitlines():
+        if line.strip() == start:
+            inside = True
+            continue
+        if end is not None and line.strip() == end and inside:
+            break
+        if not inside:
+            continue
+        text = line.strip()
+        if not (text.startswith("|") and text.endswith("|")):
+            continue
+        if "---" in text:
+            continue
+        # Skip header rows (ID/Name/Status, Kind/ID/..., Subject/..., Metric/...)
+        lowered = text.lower()
+        if lowered.startswith("| metric |") or lowered.startswith("| id |"):
+            continue
+        if lowered.startswith("| kind |") and "trigger" in lowered:
+            continue
+        if lowered.startswith("| client |") or lowered.startswith("| subject |"):
+            continue
+        rows.append(text)
+    return rows
+
+
+class TestExplicitProvenance:
+    def test_active_stale_entries_have_provenance_key(self, tmp_path):
+        db = _ingested_db(tmp_path)
+        data = report(db)
+        assert data["active"], "seed must produce active claims"
+        for entry in data["active"] + data["stale"]:
+            assert "provenance" in entry, f"missing provenance: {entry}"
+            prov = entry["provenance"]
+            assert prov is None or isinstance(prov, dict)
+            if prov is not None:
+                assert "repo" in prov and "file" in prov
+
+    def test_provenance_present_for_rules_ops_params(self, tmp_path):
+        db = _ingested_db(tmp_path)
+        data = report(db)
+        by_kind: dict[str, list[dict]] = {}
+        for entry in data["active"]:
+            by_kind.setdefault(entry["kind"], []).append(entry)
+        for kind in ("params", "rules", "operations"):
+            assert kind in by_kind, f"missing kind {kind}"
+            assert any(
+                e["provenance"] is not None for e in by_kind[kind]
+            ), f"{kind} should carry provenance"
+
+    def test_markdown_shows_provenance_or_unavailable(self, tmp_path):
+        db = _ingested_db(tmp_path)
+        data = report(db)
+        md = report_markdown(db)
+        assert "Provenance" in md
+        assert data["active"], "seed must produce active claims"
+        for entry in data["active"] + data["stale"]:
+            rendered = _md_provenance(entry.get("provenance"))
+            assert rendered in md
+            assert ":" in rendered or rendered == "source provenance unavailable"
+
+    def test_legacy_row_without_provenance_shows_unavailable(self, tmp_path):
+        from bo_ontology import schema as _schema
+        from bo_ontology.store import OntologyStore as _Store
+
+        db = _ingested_db(tmp_path)
+        with _Store(str(db)) as store:
+            store.add_parameter(
+                _schema.PolicyParameter(
+                    name="Legacy:key", value="1", description="legacy plain"
+                )
+            )
+            store.add_parameter(
+                _schema.PolicyParameter(
+                    name="Secret:key",
+                    value="sk-test-secret-abc12345",
+                    description="legacy plain",
+                )
+            )
+        record_review(
+            db, "Secret:key", reviewer="qa",
+            reason="sk-test-secret-abc12345",
+        )
+        data = report(db)
+        legacy = [e for e in data["active"] if e["name"] == "Legacy:key"]
+        assert legacy, "legacy param must appear in active"
+        assert legacy[0]["provenance"] is None
+        md = report_markdown(db)
+        assert "source provenance unavailable" in md
+        assert "[REDACTED]" in md
+        assert "\\[REDACTED\\]" not in md
+
+
+class TestCountsAgreement:
+    def test_counts_equal_rows_json_and_markdown(self, tmp_path):
+        db = _ingested_db(tmp_path)
+        param = next(e for e in report(db)["active"] if e["kind"] == "params")
+        invalidate_root(
+            db, "params", param["id"], reason="window 30->45", new_value=45
+        )
+        record_review(db, "App:windowDays", reviewer="qa", reason="looks good")
+        data = report(db)
+        assert data["counts"]["active"] == len(data["active"])
+        assert data["counts"]["stale"] == len(data["stale"])
+        assert data["counts"]["abstentions"] == len(data["abstentions"])
+        assert data["counts"]["gaps"] == len(data["gaps"])
+        assert data["counts"]["contract_links"] == len(data["contract_links"])
+        assert data["counts"]["reviews"] == len(data["reviews"])
+        md = report_markdown(db)
+        active_rows = _md_section_table_data_rows(
+            md, "## Active Claims", "## Stale Claims"
+        )
+        assert len(active_rows) == len(data["active"])
+        stale_rows = _md_section_table_data_rows(
+            md, "## Stale Claims", "## Cross-Repo Contract Links"
+        )
+        assert len(stale_rows) == len(data["stale"])
+        link_rows = _md_section_table_data_rows(
+            md, "## Cross-Repo Contract Links", "## Abstentions & Gaps"
+        )
+        # Links section renders "None" when empty; otherwise one row per link.
+        if data["contract_links"]:
+            assert len(link_rows) == len(data["contract_links"])
+        else:
+            assert link_rows == []
+        abst_rows = _md_section_table_data_rows(
+            md, "## Abstentions & Gaps", "## Human Reviews"
+        )
+        assert len(abst_rows) == len(data["abstentions"]) + len(data["gaps"])
+        review_rows = _md_section_table_data_rows(md, "## Human Reviews", None)
+        assert len(review_rows) == len(data["reviews"])
+
+
+class TestSecretLedgerDedup:
+    def test_secret_contract_link_no_duplicate_across_syncs(self, tmp_path):
+        secret_path = "/api/sk-test-secret-abc12345"
+        repo = tmp_path / "App"
+        repo.mkdir()
+        (repo / "RefundService.java").write_text(APP_SERVICE, encoding="utf-8")
+        (repo / "AppController.java").write_text(
+            APP_CONTROLLER, encoding="utf-8"
+        )
+        (repo / "AppClient.java").write_text(
+            APP_CLIENT.replace("/api/app/create", secret_path),
+            encoding="utf-8",
+        )
+        (repo / "application.yml").write_text(APP_YAML, encoding="utf-8")
+        (repo / "openapi.yaml").write_text(
+            APP_OPENAPI.replace("/api/app/create", secret_path),
+            encoding="utf-8",
+        )
+        manifest = _manifest(tmp_path, repo)
+        db = tmp_path / "wf.db"
+        ingest_manifest(manifest, db)
+        raw = {
+            "client_path": secret_path,
+            "openapi_path": secret_path,
+            "compatible": True,
+        }
+        stored = {
+            "client_path": "[REDACTED]",
+            "openapi_path": "[REDACTED]",
+            "compatible": True,
+        }
+        assert _ledger_key(CONTRACT_LINK, raw, {}) == _ledger_key(
+            CONTRACT_LINK, stored, {}
+        )
+        first = report(db)
+        assert len(first["contract_links"]) == 1
+        sync_manifest(manifest, db)
+        second = report(db)
+        assert len(second["contract_links"]) == 1
+        sync_manifest(manifest, db)
+        third = report(db)
+        assert len(third["contract_links"]) == 1
