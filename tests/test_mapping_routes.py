@@ -1389,3 +1389,132 @@ def test_petclinic_exposed_regression_readonly():
     ]
     assert all(link["compatible"] is False for link in gateway_links), gateway_links
     assert not any(link["compatible"] is True for link in gateway_links), gateway_links
+
+
+WILDCARD_STAR_CONTROLLER = """\
+package com.example.widgets;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WidgetWildcardController {
+
+    @GetMapping("/api/widgets/*/parts/{partId}")
+    public String byWildcard() {
+        return "ok";
+    }
+}
+"""
+
+WILDCARD_STAR_CLIENT = """\
+package com.example.widgets;
+
+import org.springframework.web.client.RestTemplate;
+
+public class WidgetWildcardClient {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    public String read() {
+        String url = "http://widget-svc.local/api/widgets/9/parts/1";
+        return restTemplate.getForObject(url, String.class);
+    }
+}
+"""
+
+
+def test_wildcard_star_single_segment_matches(tmp_path):
+    """Single-segment ``*`` (pinned: ``owners/*/pets/{petId}``) links a
+    concrete one-segment client URL as a declared-only compatible link."""
+    from bo_java.spring_sql_bindings import extract_client_urls
+
+    routes, _ = _routes_for(
+        tmp_path, "WidgetWildcardController.java", WILDCARD_STAR_CONTROLLER
+    )
+    assert len(routes) == 1, routes
+    route = routes[0]
+    assert route["path"] == "/api/widgets/*/parts/{partId}", routes
+    assert route["http_methods"] == ["get"], routes
+    assert route["method_annotation"]["span"]["start_line"] == route["line"], routes
+    assert route["span"]["start_line"] == route["line"], routes
+    assert route["span"]["end_line"] >= route["line"], routes
+    ops = emit_annotation_operations(routes)
+    assert len(ops) == 1 and ops[0].get("linkable") is True, ops
+    assert ops[0].get("mapping_span") == route["span"], ops
+    client_src = _write(tmp_path, "WidgetWildcardClient.java", WILDCARD_STAR_CLIENT)
+    urls = extract_client_urls(client_src)
+    assert len(urls) == 1, urls
+    links = link_client_to_annotation(urls[0], ops)
+    assert links, links
+    link = links[0]
+    assert link["compatible"] is True, link
+    assert link["destination_verified"] is False, link
+    assert link["equivalent"] is False, link
+    assert link.get("source") == "spring_annotation", link
+    assert "matches annotation template" in link["reason"], link
+
+
+def test_wildcard_star_near_miss_still_abstains(tmp_path):
+    """``*`` covers exactly one segment: a two-segment client URL never
+    links; a truly dynamic path still abstains; wrong method stays
+    incompatible."""
+    from bo_java.spring_sql_bindings import _annotation_path_match, extract_client_urls
+
+    routes, _ = _routes_for(
+        tmp_path, "WidgetWildcardController.java", WILDCARD_STAR_CONTROLLER
+    )
+    ops = emit_annotation_operations(routes)
+    multi_src = _write(
+        tmp_path,
+        "WildcardMultiClient.java",
+        "package com.example.widgets;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+        "public class WildcardMultiClient {\n"
+        "    private final RestTemplate restTemplate = new RestTemplate();\n"
+        "    public String call() {\n"
+        '        String url = "http://widget-svc.local/api/widgets/a/b/parts/1";\n'
+        "        return restTemplate.getForObject(url, String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    multi_urls = extract_client_urls(multi_src)
+    assert len(multi_urls) == 1, multi_urls
+    multi_links = link_client_to_annotation(multi_urls[0], ops)
+    assert multi_links == [] or all(
+        link["compatible"] is False for link in multi_links
+    ), multi_links
+    dyn_routes, _ = _routes_for(
+        tmp_path, "WidgetDynamicController.java", DYNAMIC_CONTROLLER
+    )
+    assert dyn_routes, dyn_routes
+    assert all(r["path"] is None for r in dyn_routes), dyn_routes
+    wrong_src = _write(
+        tmp_path,
+        "WildcardWrongMethodClient.java",
+        "package com.example.widgets;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+        "public class WildcardWrongMethodClient {\n"
+        "    private final RestTemplate restTemplate = new RestTemplate();\n"
+        "    public String call() {\n"
+        '        String url = "http://widget-svc.local/api/widgets/9/parts/1";\n'
+        "        return restTemplate.postForObject(url, new Object(), String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    wrong_urls = extract_client_urls(wrong_src)
+    assert len(wrong_urls) == 1, wrong_urls
+    wrong_links = link_client_to_annotation(wrong_urls[0], ops)
+    assert wrong_links, wrong_links
+    assert all(link["compatible"] is False for link in wrong_links), wrong_links
+    assert any(
+        "method" in str(link.get("reason", "")).lower() for link in wrong_links
+    ), wrong_links
+    # Direct matcher edges: "**" stays literal (fail-closed), partial-segment
+    # wildcards stay literal, "*" needs a non-empty segment.
+    assert _annotation_path_match("/a/**/b", "/a/x/b") is False
+    assert _annotation_path_match("/a/fo*o/b", "/a/foo/b") is False
+    assert _annotation_path_match("/a/*/b", "/a//b") is False
+    # A literal "*" client segment counts as non-empty (URLs never contain
+    # bare "*"; harmless, behavior unchanged).
+    assert _annotation_path_match("/a/*/{x}", "/a/*/b") is True
