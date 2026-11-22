@@ -56,6 +56,16 @@ Extracts binding evidence from fixture sources as plain text:
   enforcement line spans citing the guard-if body lines, not declarations),
   and each status change guarded by such a rule becomes a ``transition``
   record naming the guard and citing its enforcement lines.
+* TS/JS HTTP clients (``*.ts``/``*.js``): Angular ``HttpClient``
+  (``this.http``/``http``/``httpClient`` ``.get/post/put/delete/patch``),
+  ``fetch`` (explicit ``{method}`` or default GET) and ``axios`` (method
+  forms plus trivial ``axios({method, url})``) with literal/template/
+  single-assigned-base URL expressions (``${var}`` becomes ``{var}``;
+  ``environment.X`` host prefixes stay unknown, never fabricated).
+  Records reuse the ``client_url`` shape with ``ts: True`` on a documented
+  ``http://ts.local`` dummy host (path-only linking) so the linkers treat
+  them as declared-only candidates (``destination_verified`` False,
+  ``equivalent`` never True).
 
 Every record carries: ``origin`` (``deterministic``), ``file`` plus ``line``,
 ``content_hash`` (sha256 of the file bytes) and ``extractor_version``.
@@ -197,6 +207,20 @@ def _infer_client_method_and_line(
         )
         fluent_call = url_record.get("call_line")
         return fluent_method, fluent_call if isinstance(fluent_call, int) else None
+    if isinstance(url_record, dict) and url_record.get("ts") is True:
+        # TS/JS records (extract_ts_client_urls) carry their own invocation
+        # evidence: the receiver (HttpClient/fetch/axios) plus the call line
+        # are recorded at extraction, so the linkers reuse them directly as
+        # declared-only candidates (destination_verified False, equivalent
+        # never True), mirroring the fluent-carry above.
+        raw = url_record.get("client_method", url_record.get("method"))
+        ts_method = (
+            str(raw).strip().lower()
+            if raw is not None and str(raw).strip() != ""
+            else None
+        )
+        ts_call = url_record.get("call_line")
+        return ts_method, ts_call if isinstance(ts_call, int) else None
     try:
         lines = Path(url_record["file"]).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
@@ -815,6 +839,8 @@ def link_client_to_annotation(
             "start_line": url_record["line"],
             "end_line": url_record["line"],
         },
+        "method_reason": url_record.get("method_reason"),
+        "default_method": url_record.get("default_method", False),
     }
     for op in ops:
         link = dict(base)
@@ -3365,6 +3391,875 @@ def extract_fluent_client_urls(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+# ---------------------------------------------------------------- TS/JS HTTP clients
+
+_TS_HTTP_VERBS = ("get", "post", "put", "delete", "patch")
+_TS_DUMMY_HOST = "http://ts.local"
+
+# Receiver-name only (no type gate): a shadowed ``http`` (e.g. a local
+# ``foohttp`` or ``other.http``) that textually matches would otherwise
+# mis-emit -- out of scope by design; prefer the type-gated Java
+# RestTemplate pattern where types are available. The ``(?<![\w$.])``
+# guard mirrors fetch/axios so ``foohttp.get(...)`` / ``other.http.get(...)``
+# abstain (no match on the inner ``http.get``).
+# Limitation (abstain-by-design, no crash): nested generics such as
+# ``get<Foo<Bar>>`` do not match (single-level ``<...>`` only) and yield
+# no record.
+_TS_HTTPCLIENT_CALL = re.compile(
+    r"(?<![\w$.])(?P<recv>(?:this\s*\.\s*)?(?:http|httpClient))"
+    r"\s*\.\s*(?P<verb>get|post|put|delete|patch)"
+    r"\s*(?:<[^()<>]*>)?\s*\("
+)
+_TS_FETCH_CALL = re.compile(r"(?<![\w$.])fetch\s*\(")
+_TS_AXIOS_CALL = re.compile(
+    r"(?<![\w$.])axios\s*\.\s*(?P<verb>get|post|put|delete|patch)"
+    r"\s*(?:<[^()<>]*>)?\s*\("
+)
+_TS_AXIOS_CONFIG = re.compile(r"(?<![\w$.])axios\s*\(")
+_TS_NAME = re.compile(
+    r"^(?:this\s*\.\s*)?[A-Za-z_$][\w$]*"
+    r"(?:\s*\.\s*[A-Za-z_$][\w$]*)*$"
+)
+_TS_METHOD_KV = re.compile(r"method\s*:\s*['\"]([A-Za-z]+)['\"]")
+_TS_URL_KV = re.compile(r"\burl\s*:")
+_TS_DOTTED = re.compile(r"^[A-Za-z_$][\w$]*(\s*\.\s*[A-Za-z_$][\w$]*)+$")
+
+
+def _blank_ts_ignorable(text: str, blank_strings: bool) -> str:
+    """Same-length blanking of TS comments (plus strings when asked).
+
+    Newlines are kept so offsets map 1:1 back to the original text.
+    Template literals honor ``${...}`` nesting: literal characters are
+    blanked but embedded expressions stay code. Comment-stripped text
+    keeps strings intact (for URL extraction); fully-masked text blanks
+    both (for call/assignment detection, so a string like
+    ``"http.post('/x')"`` or a ``// http.get('/x')`` comment never emits).
+    """
+    out = list(text)
+    n = len(text)
+    stack: list[str] = ["code"]
+    expr_braces: list[int] = []
+    i = 0
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        top = stack[-1]
+        if top == "code":
+            if ch in ("'", '"'):
+                stack.append(ch)
+                if blank_strings:
+                    out[i] = " "
+                i += 1
+                continue
+            if ch == "`":
+                stack.append(ch)
+                if blank_strings:
+                    out[i] = " "
+                i += 1
+                continue
+            if ch == "/" and nxt == "/":
+                while i < n and text[i] != "\n":
+                    out[i] = " "
+                    i += 1
+                continue
+            if ch == "/" and nxt == "*":
+                out[i] = " "
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+                while i < n and not (
+                    text[i] == "*" and i + 1 < n and text[i + 1] == "/"
+                ):
+                    if text[i] != "\n":
+                        out[i] = " "
+                    i += 1
+                if i < n:
+                    out[i] = " "
+                    if i + 1 < n:
+                        out[i + 1] = " "
+                    i += 2
+                continue
+            if ch == "{" and expr_braces:
+                expr_braces[-1] += 1
+                i += 1
+                continue
+            if ch == "}" and expr_braces:
+                if expr_braces[-1] > 0:
+                    expr_braces[-1] -= 1
+                else:
+                    expr_braces.pop()
+                    stack.pop()
+                i += 1
+                continue
+            i += 1
+            continue
+        if top in ("'", '"'):
+            if ch == "\\" and i + 1 < n:
+                if blank_strings:
+                    out[i] = " "
+                    if text[i + 1] != "\n":
+                        out[i + 1] = " "
+                i += 2
+                continue
+            if ch == top:
+                if blank_strings:
+                    out[i] = " "
+                stack.pop()
+            elif blank_strings and ch != "\n":
+                out[i] = " "
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            if blank_strings:
+                out[i] = " "
+                if text[i + 1] != "\n":
+                    out[i + 1] = " "
+            i += 2
+            continue
+        if ch == "`":
+            if blank_strings:
+                out[i] = " "
+            stack.pop()
+            i += 1
+            continue
+        if ch == "$" and nxt == "{":
+            if blank_strings:
+                out[i] = " "
+                out[i + 1] = " "
+            stack.append("code")
+            expr_braces.append(0)
+            i += 2
+            continue
+        if blank_strings and ch != "\n":
+            out[i] = " "
+        i += 1
+    return "".join(out)
+
+
+def _ts_balanced_args(text: str, open_idx: int) -> str | None:
+    """Argument text for the ``(`` at ``open_idx`` (string/template aware).
+
+    ``None`` when the parens never balance (abstain, never half-parse);
+    calls may span lines (offsets map back via line starts).
+    """
+    depth = 0
+    stack: list[str] = ["code"]
+    expr_braces: list[int] = []
+    start: int | None = None
+    i = open_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        top = stack[-1]
+        if top == "code":
+            if ch in ("'", '"', "`"):
+                stack.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                if depth == 1:
+                    start = i + 1
+                i += 1
+                continue
+            if ch == ")":
+                depth -= 1
+                if depth == 0 and start is not None:
+                    return text[start:i]
+                if depth < 0:
+                    return None
+                i += 1
+                continue
+            if ch == "{" and expr_braces:
+                expr_braces[-1] += 1
+                i += 1
+                continue
+            if ch == "}" and expr_braces:
+                if expr_braces[-1] > 0:
+                    expr_braces[-1] -= 1
+                else:
+                    expr_braces.pop()
+                    stack.pop()
+                i += 1
+                continue
+            i += 1
+            continue
+        if top in ("'", '"'):
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == top:
+                stack.pop()
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            stack.pop()
+            i += 1
+            continue
+        if ch == "$" and nxt == "{":
+            stack.append("code")
+            expr_braces.append(0)
+            i += 2
+            continue
+        i += 1
+    return None
+
+
+def _ts_split_top(text: str, sep: str) -> list[str] | None:
+    """Split on top-level ``sep`` (string/template/paren/brace aware).
+
+    ``None`` when a string/template is left unterminated (abstain).
+    """
+    parts: list[str] = []
+    depth_paren = depth_brack = depth_brace = 0
+    stack: list[str] = ["code"]
+    expr_braces: list[int] = []
+    current: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        top = stack[-1]
+        if top == "code":
+            if ch in ("'", '"', "`"):
+                stack.append(ch)
+                current.append(ch)
+                i += 1
+                continue
+            if ch in ("(", "[", "{"):
+                if ch == "(":
+                    depth_paren += 1
+                elif ch == "[":
+                    depth_brack += 1
+                else:
+                    depth_brace += 1
+                    if expr_braces:
+                        expr_braces[-1] += 1
+                current.append(ch)
+                i += 1
+                continue
+            if ch in (")", "]", "}"):
+                if ch == ")" and depth_paren > 0:
+                    depth_paren -= 1
+                elif ch == "]" and depth_brack > 0:
+                    depth_brack -= 1
+                elif ch == "}":
+                    if expr_braces and expr_braces[-1] > 0:
+                        expr_braces[-1] -= 1
+                        depth_brace -= 1
+                    elif expr_braces:
+                        expr_braces.pop()
+                        stack.pop()
+                        current.append(ch)
+                        i += 1
+                        continue
+                    elif depth_brace > 0:
+                        depth_brace -= 1
+                    else:
+                        return None
+                else:
+                    return None
+                current.append(ch)
+                i += 1
+                continue
+            if (
+                ch == sep
+                and depth_paren == 0
+                and depth_brack == 0
+                and depth_brace == 0
+            ):
+                parts.append("".join(current))
+                current = []
+                i += 1
+                continue
+            current.append(ch)
+            i += 1
+            continue
+        if top in ("'", '"'):
+            current.append(ch)
+            if ch == "\\" and i + 1 < n:
+                current.append(text[i + 1])
+                i += 2
+                continue
+            if ch == top:
+                stack.pop()
+            i += 1
+            continue
+        current.append(ch)
+        if ch == "\\" and i + 1 < n:
+            current.append(text[i + 1])
+            i += 2
+            continue
+        if ch == "`":
+            stack.pop()
+            i += 1
+            continue
+        if ch == "$" and nxt == "{":
+            current.append(nxt)
+            stack.append("code")
+            expr_braces.append(0)
+            i += 2
+            continue
+        i += 1
+    if len(stack) != 1 or stack[0] != "code":
+        return None
+    parts.append("".join(current))
+    return parts
+
+
+def _ts_assign_sites(
+    masked_lines: list[str], base: str
+) -> list[tuple[int, int]]:
+    """1-based ``(line, rhs_start)`` sites assigning ``base``.
+
+    Matches ``base = ...`` plus ``this.base = ...`` (including compound
+    ``base += ...`` rebinding, which counts as a second site: reassigned)
+    while excluding ``==``/``===``/``=>``. A different receiver
+    (``other.base =``) never counts: only a bare or ``this.``-qualified
+    target does.
+    """
+    bare = base.strip()
+    if bare.startswith("this."):
+        bare = bare[5:].strip()
+    bare = bare.split(".")[0].strip()
+    if not re.fullmatch(r"[A-Za-z_$][\w$]*", bare):
+        return []
+    pattern = re.compile(
+        r"(?<![\w$.])(?:this\s*\.\s*)?" + re.escape(bare)
+        + r"\s*(?:[+\-*/%&|^])?=(?![=>])"
+    )
+    sites: list[tuple[int, int]] = []
+    for num, text in enumerate(masked_lines, start=1):
+        for match in pattern.finditer(text):
+            sites.append((num, match.end()))
+    return sites
+
+
+def _ts_rhs_text(stripped_line: str, rhs_start: int) -> str:
+    """Right-hand side on one line: up to ``;`` outside strings, or EOL."""
+    stack: list[str] = ["code"]
+    i = rhs_start
+    n = len(stripped_line)
+    while i < n:
+        ch = stripped_line[i]
+        top = stack[-1]
+        if top == "code":
+            if ch in ("'", '"', "`"):
+                stack.append(ch)
+            elif ch == ";":
+                return stripped_line[rhs_start:i]
+            i += 1
+            continue
+        if top in ("'", '"'):
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == top:
+                stack.pop()
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            stack.pop()
+            i += 1
+            continue
+        i += 1
+    return stripped_line[rhs_start:]
+
+
+def _ts_eval_operand(
+    op: str,
+    stripped_lines: list[str],
+    masked_lines: list[str],
+    seen: frozenset[str],
+    sites_out: list[int],
+) -> tuple[str, str]:
+    """One ``+``-chain operand: ``(status, value)``.
+
+    ``ok`` carries the resolved text (``${}`` already substituted);
+    ``unknown`` is an unresolvable dotted/config reference (contributes
+    nothing, marks an unknown prefix); ``dynamic`` (calls, ternaries and
+    anything non-literal) poisons the whole URL (abstain).
+    """
+    text = op.strip()
+    if not text:
+        return ("unknown", "")
+    if len(text) >= 2 and text[0] in ("'", '"') and text[-1] == text[0]:
+        return ("ok", text[1:-1])
+    if len(text) >= 2 and text[0] == "`" and text[-1] == "`":
+        return _ts_eval_template(
+            text[1:-1], stripped_lines, masked_lines, seen, sites_out
+        )
+    if "(" in text or "=>" in text:
+        return ("dynamic", "")
+    if "?" in text:
+        # ``?`` outside a string literal position starts a ternary (or
+        # optional chaining): not statically resolvable, abstain. A ``?``
+        # inside quotes (e.g. '?status=') arrives here only as part of a
+        # larger non-literal operand, which is likewise dynamic.
+        stripped_probe = re.sub(r"'[^']*'|\"[^\"]*\"|`[^`]*`", "", text)
+        if "?" in stripped_probe:
+            return ("dynamic", "")
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
+        return ("ok", text)
+    if _TS_NAME.match(text):
+        return _ts_resolve_name(
+            text, stripped_lines, masked_lines, seen, sites_out
+        )
+    return ("dynamic", "")
+
+
+def _ts_eval_template(
+    inner: str,
+    stripped_lines: list[str],
+    masked_lines: list[str],
+    seen: frozenset[str],
+    sites_out: list[int],
+) -> tuple[str, str]:
+    """Template body: ``${expr}`` becomes the resolved value or a token.
+
+    A resolvable base (single-assigned field/const) substitutes its value;
+    an unresolvable dotted reference (``environment.X``) contributes nothing
+    (unknown prefix); an unresolvable plain name (a path param) stays a
+    ``{name}`` token; anything complex (calls, ternaries) is dynamic.
+    """
+    buf: list[str] = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch == "\\" and i + 1 < n:
+            buf.append(inner[i:i + 2])
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n and inner[i + 1] == "{":
+            depth = 1
+            j = i + 2
+            jstack: list[str] = ["code"]
+            while j < n and depth > 0:
+                cj = inner[j]
+                top = jstack[-1]
+                if top == "code":
+                    if cj in ("'", '"', "`"):
+                        jstack.append(cj)
+                    elif cj == "{":
+                        depth += 1
+                    elif cj == "}":
+                        depth -= 1
+                else:
+                    if cj == "\\":
+                        j += 1
+                    elif cj == top:
+                        jstack.pop()
+                j += 1
+            if depth != 0:
+                return ("dynamic", "")
+            expr_text = inner[i + 2:j - 1].strip()
+            if _TS_NAME.match(expr_text):
+                status, value = _ts_resolve_name(
+                    expr_text, stripped_lines, masked_lines, seen, sites_out
+                )
+                if status == "dynamic":
+                    return ("dynamic", "")
+                if status == "unknown":
+                    if _TS_DOTTED.match(expr_text.replace("this.", "")) or "." in expr_text:
+                        buf.append("")
+                    else:
+                        buf.append("{" + re.sub(r"\s+", "", expr_text) + "}")
+                else:
+                    buf.append(value)
+            else:
+                return ("dynamic", "")
+            i = j
+            continue
+        buf.append(ch)
+        i += 1
+    return ("ok", "".join(buf))
+
+
+def _ts_resolve_name(
+    name: str,
+    stripped_lines: list[str],
+    masked_lines: list[str],
+    seen: frozenset[str],
+    sites_out: list[int],
+) -> tuple[str, str]:
+    """Resolve one identifier: single-assignment only, else unknown/dynamic.
+
+    Exactly one assignment site in the file resolves recursively (literal,
+    template or further composition); zero sites means a parameter (plain
+    names become ``{name}`` placeholders downstream, dotted config names
+    are unknown prefixes); reassignment (2+ sites: field initializer plus
+    setter, ``let`` rebinding, ...) abstains the whole URL as dynamic.
+    Cycles resolve as dynamic (never infinite).
+    """
+    bare = name.strip()
+    if bare.startswith("this."):
+        bare = bare[5:].strip()
+    key = bare.split(".")[0].strip()
+    if not re.fullmatch(r"[A-Za-z_$][\w$]*", key):
+        return ("dynamic", "")
+    if key in seen:
+        return ("dynamic", "")
+    if "." in bare:
+        # Dotted config reference (environment.X, config.Y): only a
+        # single-assigned alias can rescue it; otherwise unknown prefix.
+        sites = _ts_assign_sites(masked_lines, bare)
+        if len(sites) != 1:
+            return ("unknown", "")
+    else:
+        sites = _ts_assign_sites(masked_lines, key)
+        if len(sites) == 0:
+            return ("unknown", "")
+        if len(sites) > 1:
+            return ("dynamic", "")
+    if len(sites) != 1:
+        return ("unknown", "")
+    line_no, rhs_start = sites[0]
+    if not 1 <= line_no <= len(stripped_lines):
+        return ("dynamic", "")
+    rhs = _ts_rhs_text(stripped_lines[line_no - 1], rhs_start).strip()
+    if not rhs:
+        return ("dynamic", "")
+    sites_out.append(line_no)
+    status, value = _ts_eval_url_expr(
+        rhs, stripped_lines, masked_lines, seen | {key}, sites_out
+    )
+    if status == "dynamic":
+        # A resolvable base whose own value is computed still poisons the
+        # use site (never a half-resolved URL)...
+        return ("dynamic", "")
+    if status == "unknown":
+        # ...unless the base itself is just an alias of an unknown config
+        # value with no literal content: then it stays an unknown prefix.
+        probe = re.sub(r"\{[^}]*\}", "", value)
+        if re.sub(r"[^A-Za-z0-9]", "", probe) == "":
+            return ("unknown", "")
+    return (status, value)
+
+
+def _ts_eval_url_expr(
+    expr: str,
+    stripped_lines: list[str],
+    masked_lines: list[str],
+    seen: frozenset[str],
+    sites_out: list[int],
+) -> tuple[str, str]:
+    """Full URL expression: ``+``-chain concatenation of operands.
+
+    ``dynamic`` poisons the whole expression (abstain, no record);
+    ``unknown`` operands contribute nothing (unknown host/config prefix);
+    zero known literal content means the path cannot be determined
+    (abstain, missing base).
+    """
+    parts = _ts_split_top(expr, "+")
+    if parts is None:
+        return ("dynamic", "")
+    if len(parts) == 1:
+        status, value = _ts_eval_operand(
+            parts[0], stripped_lines, masked_lines, seen, sites_out
+        )
+        if status != "ok":
+            return (status, value)
+        if re.fullmatch(r"\{[A-Za-z_$][\w$.]*\}", value.strip()):
+            # A lone `` `${base}` `` template: resolve the base itself.
+            inner = value.strip()[1:-1]
+            return _ts_resolve_name(
+                inner, stripped_lines, masked_lines, seen, sites_out
+            )
+        return ("ok", value)
+    combined: list[str] = []
+    unknown_prefix = False
+    for part in parts:
+        status, value = _ts_eval_operand(
+            part, stripped_lines, masked_lines, seen, sites_out
+        )
+        if status == "dynamic":
+            return ("dynamic", "")
+        if status == "unknown":
+            unknown_prefix = True
+            bare = part.strip()
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", bare):
+                # Plain parameter inside a composition: a path segment
+                # (``'/' + orderId`` -> ``/{orderId}``).
+                combined.append("{" + bare + "}")
+            continue
+        combined.append(value)
+    _ = unknown_prefix
+    return ("ok", "".join(combined))
+
+
+def _ts_path_of(combined: str) -> str | None:
+    """Linkable path from a resolved URL expression, else None.
+
+    Absolute URLs contribute their path; otherwise the text from the first
+    ``/`` (or ``/`` + relative segments); query/fragment stripped. Bare
+    placeholders with no literal content abstain (missing base).
+    """
+    text = (combined or "").strip()
+    if not text:
+        return None
+    http_at = text.find("http://")
+    if http_at == -1:
+        http_at = text.find("https://")
+    try:
+        if http_at != -1:
+            candidate = urlparse(text[http_at:])
+            path = candidate.path or ""
+        elif text.startswith("/"):
+            path = text
+        else:
+            # Relative composition (``'owners' + '/' + id``): the whole
+            # text is path content, never a host prefix to strip.
+            path = "/" + text
+        path = path.split("?", 1)[0].split("#", 1)[0]
+    except (ValueError, AttributeError):
+        return None
+    if not path.startswith("/"):
+        return None
+    probe = re.sub(r"\{[^}]*\}", "", path)
+    if re.sub(r"[^A-Za-z0-9]", "", probe) == "":
+        return None
+    return path
+
+
+def extract_ts_client_urls(path: Path) -> list[dict[str, Any]]:
+    """TS/JS HTTP client URLs (Angular HttpClient, fetch, axios).
+
+    A record needs a supported receiver plus a statically known verb and a
+    derivable path: ``this.http``/``http``/``httpClient`` ``.get/post/put/
+    delete/patch(...)`` (verb from the method name); ``fetch(url[, {method:
+    'POST'}])`` (absent options, or options without ``method:``, defaults
+    to GET with a cited default reason; dynamic/unknown ``method:`` values
+    abstain); ``axios.get/post/put/delete/patch(url, ...)`` plus the trivial
+    ``axios({method: 'post', url: ...})`` config-object form (missing or
+    dynamic members abstain).
+
+    The URL expression may be a literal, a template (``${var}`` becomes a
+    ``{var}`` token) or a ``+`` composition whose base is single-assigned
+    in the same file (field/const/``this.`` alias, one site only, cited as
+    ``base_span``); an ``environment.X``/config host prefix is an unknown
+    prefix (never fabricated: only the known path suffix is kept).
+    Reassigned bases, computed URLs (call results, ternaries), sole unknown
+    bases, unknown verbs and non-HTTP ``.get()`` (``Map.get``) yield no
+    record (abstain), as do ``foohttp.get(...)`` / ``other.http.get(...)``
+    (receiver guard) and nested generics (``get<Foo<Bar>>`` abstains
+    by design, no crash). Comments and string literals that look like HTTP
+    calls never emit.
+
+    Records reuse the ``client_url`` shape (``url`` is the resolved path on
+    the documented ``http://ts.local`` dummy host for linker path matching
+    -- the host is never claimed -- plus ``ts: True``, ``receiver``,
+    ``call_line``/``call_text``, ``url_expr``, ``resolved_path`` and span
+    from the base definition through the call site) so the linkers treat
+    them as declared-only candidates with carried invocation evidence
+    (``destination_verified`` False, ``equivalent`` never True).
+    """
+    file = Path(path)
+    if file.suffix.lower() not in (".ts", ".js"):
+        return []
+    try:
+        text = file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    stripped = _blank_ts_ignorable(text, blank_strings=False)
+    masked = _blank_ts_ignorable(text, blank_strings=True)
+    stripped_lines = stripped.splitlines()
+    masked_lines = masked.splitlines()
+    line_starts = _line_starts(text)
+    candidates: list[tuple[int, str, str | None]] = []
+    for match in _TS_HTTPCLIENT_CALL.finditer(masked):
+        candidates.append(
+            (match.start(), "httpclient", str(match.group("verb")).lower())
+        )
+    for match in _TS_FETCH_CALL.finditer(masked):
+        candidates.append((match.start(), "fetch", None))
+    for match in _TS_AXIOS_CALL.finditer(masked):
+        candidates.append(
+            (match.start(), "axios", str(match.group("verb")).lower())
+        )
+    for match in _TS_AXIOS_CONFIG.finditer(masked):
+        candidates.append((match.start(), "axios-config", None))
+    candidates.sort()
+    records: list[dict[str, Any]] = []
+    seen_calls: set[tuple[int, str]] = set()
+    for start, kind, verb in candidates:
+        call_line = _line_of(line_starts, start)
+        open_idx = masked.find("(", start)
+        if open_idx == -1:
+            continue
+        args = _ts_balanced_args(stripped, open_idx)
+        if args is None:
+            continue
+        receiver = "axios" if kind.startswith("axios") else (
+            "fetch" if kind == "fetch" else ""
+        )
+        url_expr: str | None = None
+        method: str | None = verb
+        method_reason = "explicit"
+        default_method = False
+        url_kind = "composed"
+        if kind == "httpclient":
+            recv_match = _TS_HTTPCLIENT_CALL.match(masked, start)
+            if recv_match is None:
+                continue
+            receiver = re.sub(
+                r"\s+", "", recv_match.group("recv")
+            )
+            split = _ts_split_top(args, ",")
+            if not split or not split[0].strip():
+                continue
+            url_expr = split[0].strip()
+        elif kind == "fetch":
+            receiver = "fetch"
+            split = _ts_split_top(args, ",")
+            if not split or not split[0].strip():
+                continue
+            url_expr = split[0].strip()
+            if len(split) > 1:
+                options = split[1]
+                method_match = _TS_METHOD_KV.search(options)
+                if method_match is not None:
+                    candidate_verb = method_match.group(1).strip().lower()
+                    if candidate_verb not in _TS_HTTP_VERBS:
+                        continue
+                    method = candidate_verb
+                # ``\bmethod\s*:`` (not a substring): a mere ``method``
+                # substring such as an ``"X-method"`` header is not an
+                # explicit method, so it falls through to default GET below;
+                # only a real ``method:`` key with a dynamic/unknown value
+                # abstains.
+                elif re.search(r"\bmethod\s*:", options):
+                    continue
+                else:
+                    method = "get"
+                    default_method = True
+                    method_reason = (
+                        "default: fetch without an explicit method "
+                        "defaults to GET"
+                    )
+            else:
+                method = "get"
+                default_method = True
+                method_reason = (
+                    "default: fetch without options defaults to GET"
+                )
+        elif kind == "axios":
+            split = _ts_split_top(args, ",")
+            if not split or not split[0].strip():
+                continue
+            url_expr = split[0].strip()
+        else:
+            inner = args.strip()
+            if (
+                len(inner) >= 2
+                and inner.startswith("{")
+                and inner.endswith("}")
+            ):
+                inner = inner[1:-1]
+            else:
+                continue
+            config_parts = _ts_split_top(inner, ",")
+            if config_parts is None:
+                continue
+            method_part: str | None = None
+            url_part: str | None = None
+            for part in config_parts:
+                if _TS_METHOD_KV.search(part) is not None and method_part is None:
+                    method_part = part
+                if _TS_URL_KV.search(part) is not None and url_part is None:
+                    url_part = part
+            if method_part is None or url_part is None:
+                continue
+            method_match = _TS_METHOD_KV.search(method_part)
+            if method_match is None:
+                continue
+            candidate_verb = method_match.group(1).strip().lower()
+            if candidate_verb not in _TS_HTTP_VERBS:
+                continue
+            method = candidate_verb
+            url_match = re.match(
+                r"\s*url\s*:\s*(.+)\s*$", url_part, re.DOTALL
+            )
+            if url_match is None:
+                continue
+            url_expr = url_match.group(1).strip()
+            if not url_expr:
+                continue
+        if method is None or method not in _TS_HTTP_VERBS:
+            continue
+        if url_expr is None:
+            continue
+        sites: list[int] = []
+        status, combined = _ts_eval_url_expr(
+            url_expr, stripped_lines, masked_lines, frozenset(), sites
+        )
+        if status != "ok":
+            continue
+        resolved = _ts_path_of(combined)
+        if resolved is None:
+            continue
+        key = (call_line, resolved + "\x00" + method)
+        if key in seen_calls:
+            continue
+        seen_calls.add(key)
+        url_expr_text = url_expr.strip()
+        if (
+            len(url_expr_text) >= 2
+            and url_expr_text[0] in ("'", '"')
+            and url_expr_text[-1] == url_expr_text[0]
+        ):
+            url_kind = "literal"
+        elif (
+            len(url_expr_text) >= 2
+            and url_expr_text[0] == "`"
+            and url_expr_text[-1] == "`"
+        ):
+            url_kind = "template"
+        if kind == "axios-config":
+            url_kind = "config"
+        try:
+            call_text = stripped_lines[call_line - 1].strip()
+        except IndexError:
+            continue
+        base_span: dict[str, int] | None = None
+        if sites:
+            first = min(sites)
+            base_span = {"start_line": first, "end_line": first}
+        record = dict(_base(file, call_line))
+        record.update({
+            "kind": "client_url",
+            "url": _TS_DUMMY_HOST + resolved,
+            "ts": True,
+            "method": method,
+            "client_method": method,
+            "method_reason": method_reason,
+            "default_method": default_method,
+            "receiver": receiver,
+            "receiver_line": call_line,
+            "call_line": call_line,
+            "call_text": call_text,
+            "url_expr": url_expr_text,
+            "resolved_path": resolved,
+            "url_kind": url_kind,
+            "base_span": base_span,
+            "span": {
+                "start_line": min(sites) if sites else call_line,
+                "end_line": call_line,
+            },
+        })
+        records.append(record)
+    records.sort(key=lambda r: (int(r["line"]), str(r["url"])))
+    return records
+
+
 # ---------------------------------------------------------------- Java guards and transitions
 
 # Single-line declarations only; wrapped (multi-line) signatures abstain
@@ -4061,6 +4956,9 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
             call_text = Path(url_record["file"]).read_text(encoding="utf-8").splitlines()[call_line - 1].strip()
         except (OSError, UnicodeError, IndexError):
             call_text = None
+    # Intended (not a fix): OpenAPI links are exact-match only, while
+    # annotation links allow ``{var}`` template segments -- no new OpenAPI
+    # template logic; a template client path simply yields no OpenAPI link.
     if not any(op.get("openapi_path") == client_path for op in openapi_records):
         return []
     dup_count = 0
@@ -4089,6 +4987,8 @@ def link_client_url(url_record: dict[str, Any], openapi_records: list[dict[str, 
             "start_line": url_record["line"],
             "end_line": url_record["line"],
         },
+        "method_reason": url_record.get("method_reason"),
+        "default_method": url_record.get("default_method", False),
     }
     for op in openapi_records:
         link = dict(base)
