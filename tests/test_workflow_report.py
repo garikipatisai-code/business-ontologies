@@ -1054,3 +1054,257 @@ class TestBackingCountsDeterministicFields:
             assert "destination_verified" in obj
             assert "equivalent" in obj
 
+
+class TestWildcardWorkflowLifecycle:
+    """Whole-segment ``*`` annotation route through the stored workflow.
+
+    One synthetic server repo declares ``/api/wdgt/*/ords/{ordId}`` and one
+    client repo calls ``/api/wdgt/9/ords/1``, so a declared-only compatible
+    link forms. The lifecycle then edits the route away, repeats a sync, and
+    adds an identical route in a second repo: the historical link must stay
+    retained, turn ``stale-or-missing`` in place, never be rescued across
+    repos, and keep its declared-only flags at every stage.
+    """
+
+    SERVER_ROUTE = "/api/wdgt/*/ords/{ordId}"
+    RETIRED_ROUTE = "/api/wdgt/archive/{ordId}"
+    CLIENT_PATH = "/api/wdgt/9/ords/1"
+    SERVER_FILE = "WdgtWildcardController.java"
+    CLIENT_FILE = "WdgtOrdClient.java"
+
+    SERVER_CONTROLLER = """\
+package com.example.wdgt;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class WdgtWildcardController {
+
+    @GetMapping("__ROUTE__")
+    public ResponseEntity<String> readOrd() {
+        return ResponseEntity.ok("ok");
+    }
+}
+"""
+
+    CLIENT = """\
+package com.example.wdgt;
+
+import org.springframework.web.client.RestTemplate;
+
+public class WdgtOrdClient {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    public String readOrd() {
+        String url = "http://svc.local/api/wdgt/9/ords/1";
+        return restTemplate.getForObject(url, String.class);
+    }
+}
+"""
+
+    @classmethod
+    def _write_server(cls, base: Path, dirname: str, route: str) -> Path:
+        repo = base / dirname
+        repo.mkdir()
+        (repo / cls.SERVER_FILE).write_text(
+            cls.SERVER_CONTROLLER.replace("__ROUTE__", route),
+            encoding="utf-8",
+        )
+        return repo
+
+    @classmethod
+    def _write_client(cls, base: Path, dirname: str) -> Path:
+        repo = base / dirname
+        repo.mkdir()
+        (repo / cls.CLIENT_FILE).write_text(cls.CLIENT, encoding="utf-8")
+        return repo
+
+    @staticmethod
+    def _links_for_path(data: dict, path: str) -> list[dict]:
+        return [
+            entry for entry in data["contract_links"]
+            if isinstance(entry.get("object"), dict)
+            and entry["object"].get("openapi_path") == path
+        ]
+
+    @staticmethod
+    def _history_lengths(db: Path) -> tuple[int, int]:
+        from bo_ontology.store import OntologyStore as _Store
+
+        with _Store(str(db)) as store:
+            return (
+                len(store.history("assertions")),
+                len(store.history("operations")),
+            )
+
+    def test_wildcard_route_lifecycle_declared_only(self, tmp_path):
+        server = self._write_server(
+            tmp_path, "WdgtServer", self.SERVER_ROUTE
+        )
+        client = self._write_client(tmp_path, "WdgtClient")
+        manifest = _manifest_named(
+            tmp_path, ("WdgtServer", server), ("WdgtClient", client)
+        )
+        db = tmp_path / "wdgt_wildcard.db"
+
+        # (1) ingest: exactly one declared-only compatible link.
+        ingest_manifest(manifest, db)
+        first = report(db)
+        assert len(first["contract_links"]) == 1, first["contract_links"]
+        compatible = [
+            entry for entry in first["contract_links"]
+            if (entry.get("object") or {}).get("compatible") is True
+        ]
+        assert len(compatible) == 1, compatible
+        at_route = self._links_for_path(first, self.SERVER_ROUTE)
+        assert len(at_route) == 1, at_route
+        link = at_route[0]
+        obj = link["object"]
+        assert obj["client_path"] == self.CLIENT_PATH
+        assert obj["source"] == "spring_annotation"
+        assert obj["operation_method"] == "get"
+        assert obj["operation_repo"] == "WdgtServer"
+        assert obj["destination_verified"] is False
+        assert obj["equivalent"] is False
+        prov = obj["provenance"]
+        assert isinstance(prov, dict), prov
+        assert prov["repo"] == "cross-repo"
+        assert prov["line"] >= 1
+        assert prov["span"]["start_line"] >= 1
+        assert prov["span"]["end_line"] >= prov["span"]["start_line"]
+        # Whole-value entropy redaction may replace the absolute tmp path
+        # with the documented [REDACTED] token; file identity stays structured
+        # on the link object rather than parsed from display names.
+        assert prov["file"] in (str(client / self.CLIENT_FILE), "[REDACTED]")
+        assert obj["openapi_file"] in (
+            str(server / self.SERVER_FILE), "[REDACTED]",
+        )
+        assert obj["annotation_file"] in (
+            str(server / self.SERVER_FILE), "[REDACTED]",
+        )
+        # Two-sided evidence: client call site first, declaration second
+        # (paths redacted whole when the tmp path trips entropy redaction).
+        assert len(link["evidence"]) == 2, link["evidence"]
+        expected_ev = (
+            str(client / self.CLIENT_FILE),
+            str(server / self.SERVER_FILE),
+        )
+        for item, expected in zip(link["evidence"], expected_ev):
+            assert item["repo"] == "cross-repo"
+            assert item["extractor"] == "bo_workflow.contract_link"
+            assert item["path"] in (expected, "[REDACTED]"), item
+            assert item["line_start"] >= 1
+            assert item["line_end"] >= item["line_start"]
+        assert link["backing"]["status"] == "active", link["backing"]
+
+        # (2) source edit: retire the wildcard route, sync, and keep the
+        # historical link while its backing turns stale-or-missing.
+        (server / self.SERVER_FILE).write_text(
+            self.SERVER_CONTROLLER.replace(
+                "__ROUTE__", self.RETIRED_ROUTE
+            ),
+            encoding="utf-8",
+        )
+        sync_manifest(manifest, db)
+        second = report(db)
+        retained = self._links_for_path(second, self.SERVER_ROUTE)
+        assert len(retained) == 1, retained
+        stale_obj = retained[0]["object"]
+        assert stale_obj["compatible"] == obj["compatible"]
+        assert stale_obj["destination_verified"] == obj["destination_verified"]
+        assert stale_obj["equivalent"] == obj["equivalent"]
+        assert stale_obj["client_path"] == obj["client_path"]
+        assert stale_obj["openapi_path"] == obj["openapi_path"]
+        assert stale_obj["provenance"] == obj["provenance"]
+        assert retained[0]["evidence"] == link["evidence"]
+        stale_backing = retained[0]["backing"]
+        assert stale_backing["status"] == "stale-or-missing", stale_backing
+        assert str(stale_backing.get("reason") or "").strip(), stale_backing
+        md = report_markdown(db)
+        link_section = md.split(
+            "## Cross-Repo Contract Links", 1
+        )[1].split("\n## ", 1)[0]
+        route_rows = [
+            line for line in link_section.splitlines()
+            if line.startswith("| ") and self.SERVER_ROUTE in line
+        ]
+        assert len(route_rows) == 1, route_rows
+        assert "stale-or-missing" in route_rows[0], route_rows[0]
+
+        # (3) immediate repeat sync: no new rows, no invalidations, no
+        # cascades, and no new link/operation history entries.
+        before_history = self._history_lengths(db)
+        repeat = sync_manifest(manifest, db)
+        assert repeat["added"] == 0, repeat
+        assert repeat["invalidated_roots"] == [], repeat
+        assert repeat["cascaded_stale"] == [], repeat
+        assert self._history_lengths(db) == before_history
+        third = report(db)
+        assert len(third["contract_links"]) == len(second["contract_links"])
+        repeat_link = self._links_for_path(third, self.SERVER_ROUTE)
+        assert len(repeat_link) == 1, repeat_link
+        assert repeat_link[0]["backing"]["status"] == "stale-or-missing"
+
+        # (4) same-path route in another repo is active but never rescues
+        # the link pinned to the original repo.
+        mirror = self._write_server(
+            tmp_path, "WdgtMirror", self.SERVER_ROUTE
+        )
+        manifest_with_mirror = _manifest_named(
+            tmp_path,
+            ("WdgtServer", server),
+            ("WdgtClient", client),
+            ("WdgtMirror", mirror),
+        )
+        sync_manifest(manifest_with_mirror, db)
+        fourth = report(db)
+        pinned = [
+            entry for entry in fourth["contract_links"]
+            if isinstance(entry.get("object"), dict)
+            and entry["object"].get("openapi_path") == self.SERVER_ROUTE
+            and entry["object"].get("operation_repo") == "WdgtServer"
+        ]
+        assert len(pinned) == 1, fourth["contract_links"]
+        for entry in pinned:
+            assert entry["backing"]["status"] == (
+                "stale-or-missing"
+            ), entry
+            assert str(entry["backing"].get("reason") or "").strip(), entry
+            assert entry["object"]["compatible"] == obj["compatible"]
+            assert entry["object"]["destination_verified"] == (
+                obj["destination_verified"]
+            )
+            assert entry["object"]["equivalent"] == obj["equivalent"]
+            assert entry["object"]["provenance"] == obj["provenance"]
+            assert entry["evidence"] == link["evidence"]
+        from bo_ontology.store import OntologyStore as _Store
+
+        with _Store(str(db)) as store:
+            mirror_ops = []
+            for row in store.all("operations"):
+                body = json.loads(row.get("description") or "{}")
+                prov = body.get("provenance") or {}
+                methods = [
+                    str(m).strip().lower()
+                    for m in (body.get("http_methods") or [])
+                    if isinstance(m, str) and m.strip()
+                ]
+                if (
+                    prov.get("repo") == "WdgtMirror"
+                    and body.get("path") == self.SERVER_ROUTE
+                    and methods == ["get"]
+                ):
+                    mirror_ops.append(row)
+            assert len(mirror_ops) == 1, mirror_ops
+            assert mirror_ops[0].get("status") != "stale"
+            invalidations = [
+                e for e in store.history(
+                    "operations", mirror_ops[0]["id"]
+                )
+                if e.get("action") == "invalidate"
+            ]
+            assert invalidations == []
+
