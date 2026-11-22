@@ -536,6 +536,11 @@ _MAPPING_METHOD_DECL = re.compile(
 _MAPPING_NON_METHOD = re.compile(
     r"^(?:if|for|while|switch|catch|synchronized|new|return)\b"
 )
+# Wrapped (multi-line) method declarations join continuation lines until the
+# parens balance, bounded so genuinely unparseable declarations abstain
+# instead of swallowing the rest of the file. 8 covers real wrapped
+# signatures (e.g. 6 continuation lines) while far-shorter-than-file.
+_MAPPING_DECL_JOIN_MAX = 8
 
 
 def extract_mapping_routes(path: Path) -> list[dict[str, Any]]:
@@ -562,7 +567,12 @@ def extract_mapping_routes(path: Path) -> list[dict[str, Any]]:
     ``(...)`` yields no path literal, never half-parsed); an annotation
     sharing the declaration line (``@GetMapping("/x") public ...``)
     is not picked up (annotations are read from the consecutive lines
-    directly above the declaration only).
+    directly above the declaration only). Wrapped (multi-line) method
+    declarations join up to ``_MAPPING_DECL_JOIN_MAX`` continuation lines
+    until the parens balance (the span covers the joined lines); a
+    declaration still unbalanced beyond that bound abstains with no record
+    (never half-parsed), and single-line declarations behave exactly as
+    before.
     """
     records: list[dict[str, Any]] = []
     file = Path(path)
@@ -616,7 +626,10 @@ def extract_mapping_routes(path: Path) -> list[dict[str, Any]]:
                 break
         return current
 
+    consumed_until = 0
     for decl_line, decl_text in enumerate(lines, start=1):
+        if decl_line <= consumed_until:
+            continue
         decl_match = _MAPPING_METHOD_DECL.match(decl_text)
         if not decl_match:
             continue
@@ -627,8 +640,29 @@ def extract_mapping_routes(path: Path) -> list[dict[str, Any]]:
             continue
         if re.search(r"\b(class|interface|enum)\b", decl_text):
             continue
-        if decl_text.count("(") != decl_text.count(")"):
-            continue
+        end_line = decl_line
+        if _strip_string_literals(decl_text).count("(") != _strip_string_literals(
+            decl_text
+        ).count(")"):
+            # Wrapped (multi-line) declaration: join continuation lines
+            # until the parens balance, bounded so a genuinely unparseable
+            # declaration abstains instead of swallowing the file. Counts run
+            # on string-stripped text so a ``)``/``(`` inside a literal
+            # (``value = ")"``) never fakes an unbalanced declaration.
+            balanced = False
+            for ahead in range(1, _MAPPING_DECL_JOIN_MAX + 1):
+                if decl_line + ahead > len(lines):
+                    break
+                decl_text += " " + lines[decl_line + ahead - 1].strip()
+                end_line = decl_line + ahead
+                if _strip_string_literals(decl_text).count(
+                    "("
+                ) == _strip_string_literals(decl_text).count(")"):
+                    balanced = True
+                    break
+            if not balanced:
+                continue
+        consumed_until = max(consumed_until, end_line)
         body = {"name": decl_match.group(1), "decl": decl_line}
         owner = _owner(decl_line)
         block = _preceding_annotations(lines, decl_line)
@@ -682,7 +716,7 @@ def extract_mapping_routes(path: Path) -> list[dict[str, Any]]:
                             "args": args,
                         },
                         "reason": why,
-                        "span": {"start_line": anno_line, "end_line": decl_line},
+                        "span": {"start_line": anno_line, "end_line": end_line},
                     })
                     records.append(record)
     return records
@@ -3731,13 +3765,83 @@ def _ts_assign_sites(
         return []
     pattern = re.compile(
         r"(?<![\w$.])(?:this\s*\.\s*)?" + re.escape(bare)
-        + r"\s*(?:[+\-*/%&|^])?=(?![=>])"
+        + r"\s*(?::\s*[^=;]+)?\s*(?:[+\-*/%&|^])?=(?![=>])"
     )
     sites: list[tuple[int, int]] = []
     for num, text in enumerate(masked_lines, start=1):
         for match in pattern.finditer(text):
             sites.append((num, match.end()))
     return sites
+
+
+def _ts_block_scopes(
+    masked_lines: list[str], use_line: int
+) -> list[tuple[int, int]]:
+    """Innermost-to-outermost ``{...}`` scopes enclosing ``use_line``.
+
+    Brace matching runs on masked text (strings/comments blanked, so only
+    real braces pair). Each scope is a 1-based ``(start, end)`` line range;
+    the last entry is always the whole file, so a scope with no local
+    assignment falls back to today's file-wide single-assignment behavior
+    (module consts, class fields). Unbalanced braces never crash: unmatched
+    openers/closers are ignored and the file fallback still applies.
+    """
+    n = len(masked_lines)
+    if n == 0:
+        return [(1, 1)]
+    if not 1 <= use_line <= n:
+        return [(1, n)]
+    text = "\n".join(masked_lines)
+    starts = _line_starts(text)
+    stack: list[int] = []
+    pairs: list[tuple[int, int]] = []
+    for idx, ch in enumerate(text):
+        if ch == "{":
+            stack.append(idx)
+        elif ch == "}":
+            if stack:
+                pairs.append((stack.pop(), idx))
+    scopes: list[tuple[int, int, int, int]] = []
+    for opener, closer in pairs:
+        open_line = _line_of(starts, opener)
+        close_line = _line_of(starts, closer)
+        if open_line <= use_line <= close_line:
+            scopes.append((open_line, close_line, opener, closer))
+    scopes.sort(key=lambda s: (-s[2], s[3]))
+    return [(open_line, close_line) for open_line, close_line, _, _ in scopes] + [
+        (1, n)
+    ]
+
+
+def _ts_assign_sites_scoped(
+    masked_lines: list[str], base: str, use_line: int
+) -> list[tuple[int, int]]:
+    """Assignment sites for ``base`` visible from ``use_line``.
+
+    The innermost enclosing block of ``use_line`` with a local assignment
+    wins alone (shadowing: a method-local ``let``/``const`` keeps a
+    same-named outer value out, and a reassignment in a sibling method no
+    longer poisons a statically resolvable use here). When the innermost
+    block assigns nothing, every file-wide site counts (conservative
+    union of the visible chain: module consts plus class fields/flows), so
+    an outer ``const`` plus a same-class reassignment abstains as dynamic
+    instead of resolving to one of the two values.
+    """
+    all_sites = _ts_assign_sites(masked_lines, base)
+    if not all_sites:
+        return []
+    scopes = _ts_block_scopes(masked_lines, use_line)
+    if not scopes:
+        return []
+    inner_start, inner_end = scopes[0]
+    in_inner = [
+        (line_no, rhs_start)
+        for line_no, rhs_start in all_sites
+        if inner_start <= line_no <= inner_end
+    ]
+    if in_inner:
+        return in_inner
+    return all_sites
 
 
 def _ts_rhs_text(stripped_line: str, rhs_start: int) -> str:
@@ -3780,6 +3884,7 @@ def _ts_eval_operand(
     masked_lines: list[str],
     seen: frozenset[str],
     sites_out: list[int],
+    use_line: int,
 ) -> tuple[str, str]:
     """One ``+``-chain operand: ``(status, value)``.
 
@@ -3795,7 +3900,7 @@ def _ts_eval_operand(
         return ("ok", text[1:-1])
     if len(text) >= 2 and text[0] == "`" and text[-1] == "`":
         return _ts_eval_template(
-            text[1:-1], stripped_lines, masked_lines, seen, sites_out
+            text[1:-1], stripped_lines, masked_lines, seen, sites_out, use_line
         )
     if "(" in text or "=>" in text:
         return ("dynamic", "")
@@ -3811,7 +3916,7 @@ def _ts_eval_operand(
         return ("ok", text)
     if _TS_NAME.match(text):
         return _ts_resolve_name(
-            text, stripped_lines, masked_lines, seen, sites_out
+            text, stripped_lines, masked_lines, seen, sites_out, use_line
         )
     return ("dynamic", "")
 
@@ -3822,6 +3927,7 @@ def _ts_eval_template(
     masked_lines: list[str],
     seen: frozenset[str],
     sites_out: list[int],
+    use_line: int,
 ) -> tuple[str, str]:
     """Template body: ``${expr}`` becomes the resolved value or a token.
 
@@ -3864,7 +3970,8 @@ def _ts_eval_template(
             expr_text = inner[i + 2:j - 1].strip()
             if _TS_NAME.match(expr_text):
                 status, value = _ts_resolve_name(
-                    expr_text, stripped_lines, masked_lines, seen, sites_out
+                    expr_text, stripped_lines, masked_lines, seen, sites_out,
+                    use_line,
                 )
                 if status == "dynamic":
                     return ("dynamic", "")
@@ -3890,15 +3997,20 @@ def _ts_resolve_name(
     masked_lines: list[str],
     seen: frozenset[str],
     sites_out: list[int],
+    use_line: int,
 ) -> tuple[str, str]:
     """Resolve one identifier: single-assignment only, else unknown/dynamic.
 
-    Exactly one assignment site in the file resolves recursively (literal,
-    template or further composition); zero sites means a parameter (plain
-    names become ``{name}`` placeholders downstream, dotted config names
-    are unknown prefixes); reassignment (2+ sites: field initializer plus
-    setter, ``let`` rebinding, ...) abstains the whole URL as dynamic.
-    Cycles resolve as dynamic (never infinite).
+    Assignment sites are counted in the innermost scope enclosing the use
+    that holds any (widening to the file only when the local scope assigns
+    nothing), so a reassignment in a sibling method no longer poisons a
+    statically resolvable use here. Exactly one in-scope site resolves
+    recursively (literal, template or further composition); zero sites
+    means a parameter (plain names become ``{name}`` placeholders
+    downstream, dotted config names are unknown prefixes); reassignment
+    (2+ sites: field initializer plus setter, ``let`` rebinding, ...)
+    abstains the whole URL as dynamic. Cycles resolve as dynamic (never
+    infinite).
     """
     bare = name.strip()
     if bare.startswith("this."):
@@ -3911,11 +4023,11 @@ def _ts_resolve_name(
     if "." in bare:
         # Dotted config reference (environment.X, config.Y): only a
         # single-assigned alias can rescue it; otherwise unknown prefix.
-        sites = _ts_assign_sites(masked_lines, bare)
+        sites = _ts_assign_sites_scoped(masked_lines, bare, use_line)
         if len(sites) != 1:
             return ("unknown", "")
     else:
-        sites = _ts_assign_sites(masked_lines, key)
+        sites = _ts_assign_sites_scoped(masked_lines, key, use_line)
         if len(sites) == 0:
             return ("unknown", "")
         if len(sites) > 1:
@@ -3930,7 +4042,7 @@ def _ts_resolve_name(
         return ("dynamic", "")
     sites_out.append(line_no)
     status, value = _ts_eval_url_expr(
-        rhs, stripped_lines, masked_lines, seen | {key}, sites_out
+        rhs, stripped_lines, masked_lines, seen | {key}, sites_out, line_no
     )
     if status == "dynamic":
         # A resolvable base whose own value is computed still poisons the
@@ -3951,6 +4063,7 @@ def _ts_eval_url_expr(
     masked_lines: list[str],
     seen: frozenset[str],
     sites_out: list[int],
+    use_line: int,
 ) -> tuple[str, str]:
     """Full URL expression: ``+``-chain concatenation of operands.
 
@@ -3964,7 +4077,7 @@ def _ts_eval_url_expr(
         return ("dynamic", "")
     if len(parts) == 1:
         status, value = _ts_eval_operand(
-            parts[0], stripped_lines, masked_lines, seen, sites_out
+            parts[0], stripped_lines, masked_lines, seen, sites_out, use_line
         )
         if status != "ok":
             return (status, value)
@@ -3972,14 +4085,14 @@ def _ts_eval_url_expr(
             # A lone `` `${base}` `` template: resolve the base itself.
             inner = value.strip()[1:-1]
             return _ts_resolve_name(
-                inner, stripped_lines, masked_lines, seen, sites_out
+                inner, stripped_lines, masked_lines, seen, sites_out, use_line
             )
         return ("ok", value)
     combined: list[str] = []
     unknown_prefix = False
     for part in parts:
         status, value = _ts_eval_operand(
-            part, stripped_lines, masked_lines, seen, sites_out
+            part, stripped_lines, masked_lines, seen, sites_out, use_line
         )
         if status == "dynamic":
             return ("dynamic", "")
@@ -4044,8 +4157,10 @@ def extract_ts_client_urls(path: Path) -> list[dict[str, Any]]:
 
     The URL expression may be a literal, a template (``${var}`` becomes a
     ``{var}`` token) or a ``+`` composition whose base is single-assigned
-    in the same file (field/const/``this.`` alias, one site only, cited as
-    ``base_span``); an ``environment.X``/config host prefix is an unknown
+    in the innermost scope enclosing the call that holds any assignment
+    (widening to the file only when the local scope assigns nothing:
+    field/const/``this.`` alias, one site only, cited as ``base_span``);
+    an ``environment.X``/config host prefix is an unknown
     prefix (never fabricated: only the known path suffix is kept).
     Reassigned bases, computed URLs (call results, ternaries), sole unknown
     bases, unknown verbs and non-HTTP ``.get()`` (``Map.get``) yield no
@@ -4199,7 +4314,8 @@ def extract_ts_client_urls(path: Path) -> list[dict[str, Any]]:
             continue
         sites: list[int] = []
         status, combined = _ts_eval_url_expr(
-            url_expr, stripped_lines, masked_lines, frozenset(), sites
+            url_expr, stripped_lines, masked_lines, frozenset(), sites,
+            call_line,
         )
         if status != "ok":
             continue
