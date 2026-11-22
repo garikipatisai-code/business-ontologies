@@ -1,0 +1,8 @@
+{
+  "plan": "m3-gated-ontology",
+  "m2_baseline": "3e0c80f/98",
+  "implementation_approved": false,
+  "m3a_authorized": true,
+  "plan_sha256": "acfc449396e3165c3a3bed8ea536342b84693e6456ec8e674d190a43ec735249",
+  "m3b_execution_authorized": false
+}

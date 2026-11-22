@@ -1,0 +1,5 @@
+{
+  "plan": "m3-consolidated",
+  "supersedes": "m3-gated-ontology@acfc4493",
+  "implementation_approved": false
+}

@@ -1,0 +1,38 @@
+openapi: 3.0.3
+info:
+  title: Refund API
+  version: 1.0.0
+paths:
+  /refunds:
+    post:
+      summary: Request a refund
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                orderStatus:
+                  type: string
+                paymentStatus:
+                  type: string
+                refundStatus:
+                  type: string
+                paidAt:
+                  type: string
+                  format: date-time
+      responses:
+        '200':
+          description: Refund requested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orderId:
+                    type: string
+                  status:
+                    type: string

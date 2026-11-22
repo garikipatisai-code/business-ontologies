@@ -1,0 +1,1 @@
+{"corpus": ["repo-a", "repo-b", "repo-c"], "note": "original M2 input corpus; production extract() takes explicit paths, no name special-casing"}

@@ -1,0 +1,9 @@
+{
+  "files": {
+    "fixtures/repo-e/app.py": "405f12b3da642fb2e19f39f7b5498aae6dcb5f54c1f86de086bd632156622a10",
+    "fixtures/repo-e/rules.py": "fb40b846d145c5fa382403a13cfa7e66e8f05f737c4753d5d6a74f51105dcd5c",
+    "fixtures/repo-e/contracts.py": "320e32ef21aaded51c5f7cca786aa9fbb394334f6c61d54e9ae4e11d3733490e"
+  },
+  "timestamp": "2026-11-17T18:28:51Z",
+  "label": "M3 held-out freeze; labels sealed separately; tuning on this set reclassifies it as dev"
+}
