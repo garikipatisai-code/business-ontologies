@@ -31,6 +31,7 @@ from bo_workflow.orchestrator import (  # noqa: E402
     invalidate_root,
     record_review,
     report,
+    report_markdown,
     sync_manifest,
 )
 
@@ -115,12 +116,22 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 def cmd_report(args: argparse.Namespace) -> int:
     try:
-        data = report(args.db)
+        if args.format == "md":
+            payload = report_markdown(args.db)
+        else:
+            payload = json.dumps(
+                report(args.db), indent=2, sort_keys=True, default=str
+            )
     except (FileNotFoundError, ValueError, KeyError) as exc:
         return _fail(str(exc))
     except Exception as exc:
         return _fail(f"{type(exc).__name__}: {exc}")
-    print(json.dumps(data, indent=2, sort_keys=True, default=str))
+    if args.out is not None:
+        try:
+            Path(args.out).write_text(payload + "\n", encoding="utf-8")
+        except OSError as exc:
+            return _fail(f"cannot write --out {args.out}: {exc}")
+    print(payload)
     return 0
 
 
@@ -159,6 +170,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser("report", help="inspect active/stale/ledger/reviews")
     show.add_argument("--db", required=True)
+    show.add_argument("--format", default="json", choices=["json", "md"],
+                      help="output format (default: json)")
+    show.add_argument("--out", default=None,
+                      help="also write the printed report to this file")
     show.set_defaults(func=cmd_report)
     return parser
 
