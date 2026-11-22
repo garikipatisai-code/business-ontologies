@@ -53,6 +53,7 @@ from bo_java import spring_sql_bindings as ssb
 from bo_ontology import review as review_mod
 from bo_ontology import schema
 from bo_ontology.store import _ABSENT, OntologyStore
+from bo_store.provenance import redact_value
 
 WORKFLOW_VERSION = "bo_workflow/1.0.0"
 
@@ -790,12 +791,9 @@ def _persist_ledger(
         aggregate["counts"]["assertions"] += 1
 
 
-def ingest_manifest(
-    manifest_path: str | Path, db_path: str | Path
-) -> dict[str, Any]:
-    """Ingest every manifest repo into ``db_path``; return a summary."""
-    repos = load_manifest(manifest_path)
-    aggregate: dict[str, Any] = {
+def _new_aggregate(repos: list[dict[str, str]]) -> dict[str, Any]:
+    """Single aggregate constructor shared by ingest and sync (no drift)."""
+    return {
         "repos": [r["name"] for r in repos],
         "counts": {
             "params": 0,
@@ -834,6 +832,14 @@ def ingest_manifest(
         "_trans": {},
         "_bindings_input": {},
     }
+
+
+def ingest_manifest(
+    manifest_path: str | Path, db_path: str | Path
+) -> dict[str, Any]:
+    """Ingest every manifest repo into ``db_path``; return a summary."""
+    repos = load_manifest(manifest_path)
+    aggregate: dict[str, Any] = _new_aggregate(repos)
     with OntologyStore(str(db_path)) as store:
         for repo in repos:
             _persist_repo(store, repo["name"], repo["path"], aggregate)
@@ -891,15 +897,21 @@ def _strip_lines(text: str) -> str:
 
 
 def _prereq_key(prereqs: Any) -> list[str]:
-    """Line-free sorted prerequisite guard names for fingerprints/keys."""
+    """Line-free sorted prerequisite guard names for fingerprints/keys.
+
+    Redact-normalized so secret-shaped guard tokens match their stored
+    ``[REDACTED]`` twins instead of churning every sync.
+    """
     if not prereqs:
         return []
     items: list[str] = []
     for item in prereqs:
         if isinstance(item, dict):
-            items.append(_strip_lines(str(item.get("guard") or "")))
+            items.append(
+                redact_value(_strip_lines(str(item.get("guard") or "")))
+            )
         else:
-            items.append(_strip_lines(str(item or "")))
+            items.append(redact_value(_strip_lines(str(item or ""))))
     return sorted(items)
 
 
@@ -1091,42 +1103,52 @@ def _stored_identity(
 
 
 def _fresh_fingerprint(kind: str, item: dict[str, Any]) -> str:
-    """Semantic content hash of a freshly extracted record (line-free)."""
+    """Semantic content hash of a freshly extracted record (line-free).
+
+    Every value component is ``redact_value``-normalized so a secret-shaped
+    raw value matches its stored ``[REDACTED]`` twin (no perpetual churn,
+    no raw secret persistence in the comparison payload).
+    """
     record = item["record"]
     if kind == "params":
-        payload = ["v", record.get("value")]
+        payload = ["v", redact_value(record.get("value"))]
     elif kind == "rules":
         payload = [
             "c",
-            _strip_lines(str(record.get("condition", ""))),
-            _strip_lines(str(record.get("guard") or "")),
-            str(record.get("failure_outcome") or ""),
+            redact_value(_strip_lines(str(record.get("condition", "")))),
+            redact_value(_strip_lines(str(record.get("guard") or ""))),
+            redact_value(str(record.get("failure_outcome") or "")),
         ]
     elif kind == "transitions":
         payload = [
             "t",
-            str(record.get("target_status") or "unknown"),
-            _strip_lines(str(record.get("guard") or "")),
+            redact_value(str(record.get("target_status") or "unknown")),
+            redact_value(_strip_lines(str(record.get("guard") or ""))),
             _prereq_key(record.get("prerequisites")),
-            str(record.get("coverage") or ""),
+            redact_value(str(record.get("coverage") or "")),
         ]
     else:
         payload = [
             "o",
-            str(record.get("method") or ""),
-            str(record.get("path") or ""),
-            record.get("http_methods"),
-            record.get("class"),
+            redact_value(str(record.get("method") or "")),
+            redact_value(str(record.get("path") or "")),
+            redact_value(record.get("http_methods")),
+            redact_value(record.get("class")),
             item.get("linkable"),
-            record.get("reason"),
+            redact_value(record.get("reason")),
         ]
     return json.dumps(payload, sort_keys=True, default=str)
 
 
 def _stored_fingerprint(kind: str, row: dict[str, Any]) -> str:
-    """Semantic content hash of a stored row, mirroring the fresh shape."""
+    """Semantic content hash of a stored row, mirroring the fresh shape.
+
+    Same ``redact_value`` normalization as the fresh side: the store
+    already redacts on INSERT, and re-normalizing here keeps the
+    comparison idempotent (``redact_value("[REDACTED]")`` is stable).
+    """
     if kind == "params":
-        payload = ["v", row.get("value")]
+        payload = ["v", redact_value(row.get("value"))]
     elif kind == "rules":
         guard_val = row.get("preconditions")
         if isinstance(guard_val, list):
@@ -1145,9 +1167,9 @@ def _stored_fingerprint(kind: str, row: dict[str, Any]) -> str:
                 guard_val, outcome_val = match.group(1), match.group(2)
         payload = [
             "c",
-            _strip_lines(str(row.get("value", ""))),
-            _strip_lines(str(guard_val or "")),
-            str(outcome_val or ""),
+            redact_value(_strip_lines(str(row.get("value", "")))),
+            redact_value(_strip_lines(str(guard_val or ""))),
+            redact_value(str(outcome_val or "")),
         ]
     elif kind == "transitions":
         trigger = _as_json(row.get("trigger")) or {}
@@ -1155,10 +1177,10 @@ def _stored_fingerprint(kind: str, row: dict[str, Any]) -> str:
             trigger = {}
         payload = [
             "t",
-            str(row.get("target") or "unknown"),
-            _strip_lines(str(row.get("guard") or "")),
+            redact_value(str(row.get("target") or "unknown")),
+            redact_value(_strip_lines(str(row.get("guard") or ""))),
             _prereq_key(trigger.get("prerequisites")),
-            str(trigger.get("coverage") or ""),
+            redact_value(str(trigger.get("coverage") or "")),
         ]
     else:
         body = _as_json(row.get("description")) or {}
@@ -1166,12 +1188,12 @@ def _stored_fingerprint(kind: str, row: dict[str, Any]) -> str:
             body = {}
         payload = [
             "o",
-            str(body.get("handler") or ""),
-            str(body.get("path") or ""),
-            body.get("http_methods"),
-            body.get("class"),
+            redact_value(str(body.get("handler") or "")),
+            redact_value(str(body.get("path") or "")),
+            redact_value(body.get("http_methods")),
+            redact_value(body.get("class")),
             body.get("linkable"),
-            body.get("reason"),
+            redact_value(body.get("reason")),
         ]
     return json.dumps(payload, sort_keys=True, default=str)
 
@@ -1221,26 +1243,28 @@ def _ledger_key(
     The file-less key exists only for shapes carrying a file component; it
     lets a fresh entry match a stored row whose file path was redacted to
     ``[REDACTED]`` on insert. Either element may be None (unparseable).
+    Secret-shaped components are ``redact_value``-normalized on both
+    sides so fresh raw values match stored ``[REDACTED]`` twins.
     """
     if not isinstance(obj, dict):
         return None, None
     if predicate == CONTRACT_LINK:
         key = (
             "contract_link",
-            obj.get("client_path"),
-            obj.get("openapi_path"),
+            redact_value(obj.get("client_path")),
+            redact_value(obj.get("openapi_path")),
             bool(obj.get("compatible")),
         )
         return key, None
     kind = obj.get("kind")
     repo = obj.get("repo", "")
-    rel = _rel_any(repo_paths, str(obj.get("file") or ""))
+    rel = redact_value(_rel_any(repo_paths, str(obj.get("file") or "")))
     if kind == "unguarded_transition":
-        guard = _strip_lines(str(obj.get("guard") or ""))
-        coverage = str(obj.get("coverage") or "")
+        guard = redact_value(_strip_lines(str(obj.get("guard") or "")))
+        coverage = redact_value(str(obj.get("coverage") or ""))
         prereqs = _prereq_key(obj.get("prerequisites"))
         prereq_json = json.dumps(prereqs, sort_keys=True, default=str)
-        target = str(obj.get("target") or "unknown")
+        target = redact_value(str(obj.get("target") or "unknown"))
         key = (
             "abstention",
             kind,
@@ -1261,10 +1285,10 @@ def _ledger_key(
             prereq_json,
         )
     if kind == "unlinkable_route":
-        handler = str(obj.get("handler") or "unknown")
-        path = str(obj.get("path") or "")
+        handler = redact_value(str(obj.get("handler") or "unknown"))
+        path = redact_value(str(obj.get("path") or ""))
         methods_json = json.dumps(
-            obj.get("http_methods"), sort_keys=True, default=str
+            redact_value(obj.get("http_methods")), sort_keys=True, default=str
         )
         key = ("abstention", kind, repo, rel, handler, path, methods_json)
         return key, ("abstention", kind, repo, handler, path, methods_json)
@@ -1273,12 +1297,18 @@ def _ledger_key(
             "abstention",
             kind,
             repo,
-            obj.get("operation_id"),
-            obj.get("path"),
+            redact_value(obj.get("operation_id")),
+            redact_value(obj.get("path")),
         )
         return key, None
     if kind == "inheritance_gap":
-        key = ("gap", kind, repo, obj.get("class"), obj.get("superclass"))
+        key = (
+            "gap",
+            kind,
+            repo,
+            redact_value(obj.get("class")),
+            redact_value(obj.get("superclass")),
+        )
         return key, None
     if kind == "declared_only_enforcement":
         key = (
@@ -1286,13 +1316,13 @@ def _ledger_key(
             kind,
             repo,
             rel,
-            _strip_lines(str(obj.get("reason", ""))),
+            redact_value(_strip_lines(str(obj.get("reason", "")))),
         )
         return key, (
             "gap",
             kind,
             repo,
-            _strip_lines(str(obj.get("reason", ""))),
+            redact_value(_strip_lines(str(obj.get("reason", "")))),
         )
     if kind is None:
         return None, None
@@ -1301,13 +1331,13 @@ def _ledger_key(
         kind,
         repo,
         rel,
-        _strip_lines(str(obj.get("reason", ""))),
+        redact_value(_strip_lines(str(obj.get("reason", "")))),
     )
     return key, (
         predicate,
         kind,
         repo,
-        _strip_lines(str(obj.get("reason", ""))),
+        redact_value(_strip_lines(str(obj.get("reason", "")))),
     )
 
 
@@ -1315,45 +1345,7 @@ def _fresh_aggregate(
     repos: list[dict[str, str]],
 ) -> tuple[dict[str, Any], dict[str, dict[str, list[dict[str, Any]]]]]:
     """Extract every manifest repo without inserting (sync source of truth)."""
-    aggregate: dict[str, Any] = {
-        "repos": [r["name"] for r in repos],
-        "counts": {
-            "params": 0,
-            "rules": 0,
-            "transitions": 0,
-            "operations": 0,
-            "assertions": 0,
-            "dependencies": 0,
-            "contract_links": 0,
-            "compatible_links": 0,
-        },
-        "telemetry": {
-            "mapping_routes": 0,
-            "field_constraints": 0,
-            "record_constraints": 0,
-            "interfaces": 0,
-            "implementations": 0,
-            "jpa_entities": 0,
-            "jpa_links": 0,
-            "sql_records": 0,
-            "openapi_operations": 0,
-            "client_urls": 0,
-            "enforced_rules": 0,
-            "raw_transitions": 0,
-        },
-        "abstentions": [],
-        "gaps": [],
-        "openapi": [],
-        "annotation_operations": [],
-        "client_urls": [],
-        "_param_ids": {},
-        "_rule_ids": {},
-        "_trans_ids": {},
-        "_policies": {},
-        "_guards": {},
-        "_trans": {},
-        "_bindings_input": {},
-    }
+    aggregate: dict[str, Any] = _new_aggregate(repos)
     pendings: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for repo in repos:
         pendings[repo["name"]] = _extract_repo_state(
@@ -1398,6 +1390,14 @@ def sync_manifest(
     # Dependents first: invalidating a root cascades toward its dependents,
     # so classifying/applying operations -> transitions -> rules -> params
     # guarantees every kind is diffed against its pre-sync state.
+    # Classify-then-apply per kind: first bucket fresh vs stored (active /
+    # stale) and flag each fresh item (_sync_live / _sync_changed /
+    # _sync_known_stale / _sync_reinsert); then apply invalidates + inserts
+    # for that kind before moving to the next. Cascades applied here may
+    # stale rows of a later (already-classified) kind, so a liveness
+    # fixup below re-checks every flagged-live endpoint before edges are
+    # re-derived only among still-active rows. Comment-only: no behavior
+    # change; splitting phases further would risk cross-kind drift.
     sync_order = tuple(reversed(pending_kinds))
 
     def _note_cascade(pairs: list[tuple]) -> None:
@@ -1482,11 +1482,13 @@ def sync_manifest(
                 if ident in fresh_by_id:
                     fresh_items = fresh_by_id.get(ident, [])
                     eff = effective_stored.get(ident)
-                    actives = (
-                        stored_by_id.get(eff, {}).get("active", [])
+                    bucket = (
+                        stored_by_id.get(eff, {})
                         if eff is not None
-                        else []
+                        else {}
                     )
+                    actives = list(bucket.get("active", []))
+                    stales = list(bucket.get("stale", []))
                 else:
                     # Stored-only: skip removal when a redacted row's
                     # file-less key still has a fresh counterpart (the
@@ -1500,23 +1502,86 @@ def sync_manifest(
                         continue
                     fresh_items = []
                     actives = stored_by_id.get(ident, {}).get("active", [])
-                for pos, item in enumerate(fresh_items):
-                    if pos >= len(actives):
-                        continue  # inserted below
-                    row = actives[pos]
-                    if _fresh_fingerprint(kind, item) == _stored_fingerprint(
-                        kind, row
-                    ):
+                    stales = []
+                used_active = [False] * len(actives)
+                used_stale = [False] * len(stales)
+                for item in fresh_items:
+                    fp = _fresh_fingerprint(kind, item)
+                    # Prefer an active row with the same fingerprint:
+                    # unchanged, never touch a stale duplicate.
+                    same = next(
+                        (
+                            j
+                            for j, row in enumerate(actives)
+                            if not used_active[j]
+                            and _stored_fingerprint(kind, row) == fp
+                        ),
+                        None,
+                    )
+                    if same is not None:
+                        used_active[same] = True
                         unchanged += 1
                         item["_sync_live"] = True
-                        item["_sync_id"] = row["id"]
-                    else:
+                        item["_sync_id"] = actives[same]["id"]
+                        continue
+                    # Active row, different fingerprint: modified.
+                    other = next(
+                        (
+                            j
+                            for j in range(len(actives))
+                            if not used_active[j]
+                        ),
+                        None,
+                    )
+                    if other is not None:
+                        used_active[other] = True
                         item["_sync_changed"] = True
-                        # Remember which stored row this changed item
-                        # replaces so the apply step invalidates the
-                        # fallback row, not a same-shaped exact row.
-                        item["_sync_effective"] = effective_stored.get(ident)
-                for row in actives[len(fresh_items):]:
+                        # Remember the exact stored row this changed
+                        # item replaces so the apply step invalidates
+                        # the fallback row, not a same-shaped exact row.
+                        item["_sync_old_id"] = actives[other]["id"]
+                        item["_sync_old_span"] = _stored_span(
+                            kind, actives[other]
+                        )
+                        continue
+                    # Only stale row(s), same fingerprint:
+                    # already-known-stale. Do nothing: no insert, no
+                    # audit, no edge re-derivation. Counted unchanged
+                    # so a clean re-run accounts every fresh fact.
+                    known = next(
+                        (
+                            k
+                            for k, row in enumerate(stales)
+                            if not used_stale[k]
+                            and _stored_fingerprint(kind, row) == fp
+                        ),
+                        None,
+                    )
+                    if known is not None:
+                        used_stale[known] = True
+                        unchanged += 1
+                        item["_sync_known_stale"] = True
+                        continue
+                    # Stale row, different fingerprint: the source
+                    # changed again on a stale fact. Insert a
+                    # replacement as new active below; leave the old
+                    # stale row alone (no re-audit).
+                    replaced = next(
+                        (
+                            k
+                            for k in range(len(stales))
+                            if not used_stale[k]
+                        ),
+                        None,
+                    )
+                    if replaced is not None:
+                        used_stale[replaced] = True
+                        item["_sync_reinsert"] = True
+                        continue
+                    # Brand-new fact: inserted below with no flags.
+                for j, row in enumerate(actives):
+                    if used_active[j]:
+                        continue
                     rel = ident[2] if len(ident) > 2 else ""
                     # For fallback pairs the fresh rel is informative;
                     # "[REDACTED]" alone would hide which file changed.
@@ -1538,15 +1603,11 @@ def sync_manifest(
                         _note_cascade(pairs)
 
             for ident, fresh_items in fresh_by_id.items():
-                eff = effective_stored.get(ident)
-                actives = (
-                    stored_by_id.get(eff, {}).get("active", [])
-                    if eff is not None
-                    else []
-                )
-                for pos, item in enumerate(fresh_items):
-                    if pos < len(actives) and not item.get("_sync_changed"):
-                        continue
+                for item in fresh_items:
+                    if item.get("_sync_known_stale"):
+                        continue  # already-known-stale: nothing to do
+                    if item.get("_sync_live"):
+                        continue  # unchanged active row
                     repo = ident[1]
                     repo_path = repo_paths[repo]
                     provenance = item["provenance"]
@@ -1569,10 +1630,10 @@ def sync_manifest(
                             provenance,
                             item.get("linkable", False),
                         )
-                    if pos < len(actives):
-                        row = actives[pos]
+                    if item.get("_sync_changed"):
+                        old_id = item["_sync_old_id"]
                         rel = ident[2] if len(ident) > 2 else ""
-                        span = _stored_span(kind, row)
+                        span = item.get("_sync_old_span", "L?-L?")
                         if kind == "params":
                             # Never interpolate raw values: the reason is
                             # audited and echoed in the sync summary/CLI.
@@ -1589,19 +1650,19 @@ def sync_manifest(
                         if kind in _VALUE_KINDS:
                             pairs = store.invalidate_cascade(
                                 kind,
-                                row["id"],
+                                old_id,
                                 reason,
                                 record.value,
                             )
                         else:
                             pairs = store.invalidate_cascade(
-                                kind, row["id"], reason
+                                kind, old_id, reason
                             )
                         if pairs:
                             invalidated_roots.append(
                                 {
                                     "kind": kind,
-                                    "id": row["id"],
+                                    "id": old_id,
                                     "reason": reason,
                                 }
                             )

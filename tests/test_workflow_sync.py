@@ -147,6 +147,11 @@ def _counts(db: Path) -> dict[str, int]:
             for k in ("params", "rules", "transitions",
                       "operations", "assertions")
         }
+        # Dependencies live in their own edge table (no store.all kind);
+        # count rows directly so ledger/edge drift is caught by convergence.
+        out["dependencies"] = store.conn.execute(
+            "SELECT COUNT(*) FROM dependencies"
+        ).fetchone()[0]
         out["history"] = len(store.history())
         out["reviews"] = len(store.reviews())
     return out
@@ -291,6 +296,130 @@ class TestSyncIdempotent:
         assert second["cascaded_stale"] == []
 
         assert _counts(db) == before
+
+
+# ---------------------------------------------------------------- post-change convergence
+
+
+class TestSyncPostChangeConvergence:
+    def test_post_change_second_sync_is_idempotent(self, tmp_path):
+        gamma, delta = _build_repos(tmp_path)
+        manifest = _manifest(tmp_path, gamma, delta)
+        db = tmp_path / "wf.db"
+        ingest_manifest(manifest, db)
+
+        with OntologyStore(str(db)) as store:
+            gamma_rule, _ = _gamma_names(store)
+            gamma_param = _row_by_name(store, "params", "Gamma:windowDays")
+        record_review(
+            db, gamma_rule, reviewer="qa", reason="guard matches policy")
+
+        # s1: value change -> root invalidated + cascade, replacement added.
+        (gamma / "application.yml").write_text(
+            "windowDays: 45\n", encoding="utf-8")
+        s1 = sync_manifest(manifest, db)
+        assert s1["added"] == 1
+        roots = {(r["kind"], r["id"]) for r in s1["invalidated_roots"]}
+        assert ("params", gamma_param["id"]) in roots
+        assert s1["cascaded_stale"]
+        counts_after_s1 = _counts(db)
+
+        # s2: zero file edits -> strictly idempotent.
+        s2 = sync_manifest(manifest, db)
+        assert s2["added"] == 0
+        assert s2["invalidated_roots"] == []
+        assert s2["cascaded_stale"] == []
+        # Every fresh fact is unchanged: s1's single changed fact is now
+        # stable, so s2 unchanged covers the whole fresh set
+        # (total fresh == s1 unchanged + s1 added, one insert per change).
+        assert s2["unchanged"] == s1["unchanged"] + s1["added"]
+        assert s2["unchanged"] > 0
+
+        # No duplicate rows and no new history entries between s1 and s2.
+        assert _counts(db) == counts_after_s1
+
+        # s3: convergence holds on the next pass too.
+        s3 = sync_manifest(manifest, db)
+        assert s3["added"] == 0
+        assert s3["invalidated_roots"] == []
+        assert s3["cascaded_stale"] == []
+        assert s3["unchanged"] == s2["unchanged"]
+        assert _counts(db) == counts_after_s1
+
+        # Prior review stays inspectable; replacement param stays active.
+        with OntologyStore(str(db)) as store:
+            assert any(r.get("reviewer") == "qa" for r in store.reviews())
+            fresh = [r for r in store.all("params")
+                     if r.get("name") == "Gamma:windowDays"]
+            assert len(fresh) == 2
+            live = next(
+                r for r in fresh if r["id"] != gamma_param["id"])
+            assert live["value"] == "45"
+
+    def test_revert_to_stale_value_reinserts_without_reauditing_stale(
+            self, tmp_path):
+        gamma, delta = _build_repos(tmp_path)
+        manifest = _manifest(tmp_path, gamma, delta)
+        db = tmp_path / "wf.db"
+        ingest_manifest(manifest, db)
+        with OntologyStore(str(db)) as store:
+            orig = _row_by_name(store, "params", "Gamma:windowDays")
+            assert orig["value"] == "30"
+
+        # s1: 30 -> 45 invalidates the 30 root and inserts an active 45.
+        (gamma / "application.yml").write_text(
+            "windowDays: 45\n", encoding="utf-8")
+        s1 = sync_manifest(manifest, db)
+        assert s1["added"] == 1
+        with OntologyStore(str(db)) as store:
+            mid45 = next(
+                r for r in store.all("params")
+                if r.get("name") == "Gamma:windowDays"
+                and r["id"] != orig["id"])
+            assert mid45["value"] == "45"
+            assert _actions(store, "params", orig["id"]) == [
+                "insert", "invalidate"]
+            assert _actions(store, "params", mid45["id"]) == ["insert"]
+            hist_orig_after_s1 = store.history("params", orig["id"])
+            hist_mid_after_s1 = store.history("params", mid45["id"])
+
+        # s2: revert 45 -> 30. Same identity, different fingerprint from
+        # the active 45 but equal to the stale 30: insert a new active 30,
+        # invalidate only the 45 root, leave the old stale 30 untouched
+        # (no duplicate invalidate on stale).
+        (gamma / "application.yml").write_text(
+            "windowDays: 30\n", encoding="utf-8")
+        s2 = sync_manifest(manifest, db)
+        assert s2["added"] == 1
+        roots = {(r["kind"], r["id"]) for r in s2["invalidated_roots"]}
+        assert ("params", mid45["id"]) in roots
+        assert ("params", orig["id"]) not in roots
+
+        with OntologyStore(str(db)) as store:
+            rows = [r for r in store.all("params")
+                    if r.get("name") == "Gamma:windowDays"]
+            assert len(rows) == 3
+            # Old stale 30 untouched: no new audit entries.
+            assert store.history("params", orig["id"]) == hist_orig_after_s1
+            assert _actions(store, "params", orig["id"]) == [
+                "insert", "invalidate"]
+            # Old active 45 now stale via exactly one invalidate.
+            assert _actions(store, "params", mid45["id"]) == [
+                "insert", "invalidate"]
+            assert len(store.history("params", mid45["id"])) == (
+                len(hist_mid_after_s1) + 1)
+            # Replacement 30 is active with a clean single insert.
+            fresh30 = next(
+                r for r in rows
+                if r["id"] not in (orig["id"], mid45["id"]))
+            assert fresh30["value"] == "30"
+            assert _actions(store, "params", fresh30["id"]) == ["insert"]
+
+        # s3: clean re-run after the revert converges (no churn).
+        s3 = sync_manifest(manifest, db)
+        assert s3["added"] == 0
+        assert s3["invalidated_roots"] == []
+        assert s3["cascaded_stale"] == []
 
 
 # ---------------------------------------------------------------- removal
@@ -462,6 +591,39 @@ class TestSyncSecretRedaction:
                     assert secret_old not in str(detail)
                     assert secret_new not in str(detail)
                     assert "sk-" not in str(detail)
+
+    def test_secret_value_sync_is_idempotent_no_churn(self, tmp_path):
+        gamma, delta = _build_repos(tmp_path)
+        secret = "sk-abcdefgh12345678XYZ"
+        (gamma / "application.yml").write_text(
+            f"windowDays: {secret}\n", encoding="utf-8")
+        manifest = _manifest(tmp_path, gamma, delta)
+        db = tmp_path / "wf.db"
+        ingest_manifest(manifest, db)
+
+        with OntologyStore(str(db)) as store:
+            rows = [r for r in store.all("params")
+                    if r.get("name") == "Gamma:windowDays"]
+            assert len(rows) == 1
+            # Raw secret never persists; the store redacts on INSERT.
+            assert rows[0].get("value") == "[REDACTED]"
+            assert secret not in json.dumps(rows[0], default=str)
+
+        before = _counts(db)
+        first = sync_manifest(manifest, db)
+        assert first["added"] == 0
+        assert first["invalidated_roots"] == []
+        assert first["cascaded_stale"] == []
+        assert first["unchanged"] > 0
+        assert _counts(db) == before
+
+        blob = json.dumps(first, default=str)
+        assert "sk-" not in blob and secret not in blob
+        with OntologyStore(str(db)) as store:
+            for row in store.all("params"):
+                for entry in store.history("params", row["id"]):
+                    assert secret not in str(entry.get("detail", ""))
+                    assert "sk-" not in str(entry.get("detail", ""))
 
 
 # ---------------------------------------------------------------- symlink + absolute cap
