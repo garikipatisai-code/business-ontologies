@@ -4,6 +4,7 @@
 Samples::
 
     python3 scripts/bo_workflow.py ingest --manifest m.json --db out.db
+    python3 scripts/bo_workflow.py sync --manifest m.json --db out.db
     python3 scripts/bo_workflow.py report --db out.db
     python3 scripts/bo_workflow.py review --db out.db --subject NAME \\
         --reviewer qa --reason "looks good"
@@ -30,6 +31,7 @@ from bo_workflow.orchestrator import (  # noqa: E402
     invalidate_root,
     record_review,
     report,
+    sync_manifest,
 )
 
 
@@ -100,6 +102,17 @@ def cmd_invalidate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    try:
+        summary = sync_manifest(args.manifest, args.db)
+    except (FileNotFoundError, ValueError, KeyError) as exc:
+        return _fail(str(exc))
+    except Exception as exc:  # never a traceback crash
+        return _fail(f"{type(exc).__name__}: {exc}")
+    print(json.dumps(summary, indent=2, sort_keys=True, default=str))
+    return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     try:
         data = report(args.db)
@@ -138,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
     invalidate.add_argument("--reason", default=None)
     invalidate.add_argument("--new-value", default=None)
     invalidate.set_defaults(func=cmd_invalidate)
+
+    sync = sub.add_parser("sync", help="diff sources and re-ingest changes")
+    sync.add_argument("--manifest", required=True)
+    sync.add_argument("--db", required=True)
+    sync.set_defaults(func=cmd_sync)
 
     show = sub.add_parser("report", help="inspect active/stale/ledger/reviews")
     show.add_argument("--db", required=True)

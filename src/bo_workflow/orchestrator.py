@@ -241,19 +241,163 @@ def _is_linkable_route(route: dict[str, Any]) -> bool:
     )
 
 
+# ---------------------------------------------------------------- builders
+
+# Schema-record builders shared by ingest inserts and sync re-inserts, so a
+# re-ingested row is byte-identical to its ingest-time twin.
+
+
+def _param_record(
+    repo_name: str, policy: dict[str, Any], provenance: dict[str, Any]
+) -> schema.PolicyParameter:
+    """Build the stored parameter row for one YAML policy."""
+    return schema.PolicyParameter(
+        name=f"{repo_name}:{policy.get('key')}",
+        value=policy.get("value"),
+        description=json.dumps(provenance, sort_keys=True),
+    )
+
+
+def _rule_record(
+    repo_name: str,
+    repo_path: str,
+    guard: dict[str, Any],
+    provenance: dict[str, Any],
+) -> schema.Rule:
+    """Build the stored rule row for one enforced guard."""
+    condition = str(guard.get("condition", ""))
+    try:
+        rel_guard = Path(guard["file"]).relative_to(repo_path)
+    except ValueError:
+        rel_guard = Path(guard["file"]).name
+    return schema.Rule(
+        name=f"{repo_name}:{rel_guard.as_posix()}"
+        f":L{guard.get('guard_if_line')}:{condition[:48]}",
+        value=condition,
+        statement=(
+            f"enforced rule {guard.get('guard')!r}: "
+            f"{condition} -> {guard.get('failure_outcome')}"
+        ),
+        predicate=condition,
+        preconditions=guard.get("guard"),
+        outcomes=guard.get("failure_outcome"),
+        supporting=[provenance],
+        evidence=_evidence(provenance),
+    )
+
+
+def _transition_record(
+    trans: dict[str, Any], provenance: dict[str, Any]
+) -> schema.Transition:
+    """Build the stored transition row for one guarded status write."""
+    target = str(trans.get("target_status") or "unknown")
+    trigger = json.dumps(
+        {
+            "status_write": target,
+            "provenance": provenance,
+            "prerequisites": trans.get("prerequisites") or [],
+            "coverage": trans.get("coverage") or "",
+        },
+        sort_keys=True,
+    )
+    return schema.Transition(
+        source=None,
+        target=target or "unknown",
+        guard=trans.get("guard"),
+        trigger=trigger,
+        evidence=_evidence(provenance),
+    )
+
+
+def _operation_record(
+    repo_name: str,
+    route: dict[str, Any],
+    provenance: dict[str, Any],
+    linkable: bool,
+) -> schema.Operation:
+    """Build the stored operation row for one mapping route."""
+    methods = route.get("http_methods")
+    body = {
+        "http_methods": methods,
+        "path": route.get("path"),
+        "class": route.get("class"),
+        "handler": route.get("method"),
+        "linkable": linkable,
+        "reason": route.get("reason"),
+        "provenance": provenance,
+    }
+    handler = route.get("method") or "unknown"
+    opath = route.get("path") or "unlinkable"
+    return schema.Operation(
+        name=f"{repo_name}:{handler}:{opath}:L{provenance['line']}",
+        description=json.dumps(body, sort_keys=True),
+        evidence=_evidence(provenance),
+    )
+
+
+def _contract_assertion(link: dict[str, Any]) -> schema.Assertion:
+    """Build the stored contract-link assertion for one resolved link."""
+    provenance = _provenance("cross-repo", link, "bo_workflow.contract_link")
+    payload = {
+        "client_url": link.get("client_url"),
+        "client_path": link.get("client_path"),
+        "openapi_path": link.get("openapi_path"),
+        "compatible": bool(link.get("compatible")),
+        "equivalent": False,
+        "destination_verified": False,
+        "destination_evidence": link.get("destination_evidence"),
+        "reason": link.get("reason"),
+        "provenance": provenance,
+    }
+    return schema.Assertion(
+        subject=f"link:{link.get('client_path')}"
+        f":{link.get('openapi_path')}:{link.get('line')}",
+        predicate=CONTRACT_LINK,
+        object=payload,
+        evidence=_contract_evidence(link),
+    )
+
+
+def _ledger_assertion(
+    entry: dict[str, Any], seq: int, predicate: str
+) -> schema.Assertion:
+    """Build the stored abstention/gap assertion for one ledger entry."""
+    provenance = {
+        "repo": entry.get("repo", ""),
+        "file": str(entry.get("file", "")),
+        "line": int(entry.get("line", 1)),
+        "span": entry.get("span") or {"start_line": 1, "end_line": 1},
+        "content_hash": "",
+        "extractor": "bo_workflow",
+        "extractor_version": WORKFLOW_VERSION,
+        "origin": "deterministic",
+    }
+    leaf = "gap" if predicate == GAP else "abstention"
+    return schema.Assertion(
+        subject=f"{provenance['repo']}:{leaf}:{seq}",
+        predicate=predicate,
+        object={**entry, "provenance": provenance},
+    )
+
+
 # ---------------------------------------------------------------- ingest
 
 
-def _persist_repo(
-    store: OntologyStore,
-    repo_name: str,
-    repo_path: str,
-    aggregate: dict[str, Any],
-) -> None:
-    """Extract one repo, persist claims, and accumulate cross-repo inputs."""
+def _extract_repo_state(
+    repo_name: str, repo_path: str, aggregate: dict[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    """Extract one repo without inserting (pure; shared by ingest + sync).
+
+    Runs the same extractor calls as ingest, accumulates cross-repo inputs,
+    telemetry, abstentions and gaps into ``aggregate``, and returns the
+    pending per-kind ``[{"record", "provenance", ...}]`` payloads.
+    """
+    _check_repo_tree(repo_path)
     index = ssb.index([repo_path])
     records = index["records"]
-    java_files = sorted(Path(repo_path).rglob("*.java"))
+    java_files = sorted(
+        p for p in Path(repo_path).rglob("*.java") if not p.is_symlink()
+    )
 
     field_constraints: list[dict[str, Any]] = []
     interfaces: list[dict[str, Any]] = []
@@ -288,75 +432,44 @@ def _persist_repo(
     aggregate["annotation_operations"].extend(records["annotation_operations"])
     aggregate["client_urls"].extend(records["client_urls"])
 
-    param_ids: dict[str, Any] = {}
+    pending: dict[str, list[dict[str, Any]]] = {
+        "policies": [],
+        "guards": [],
+        "transitions": [],
+        "routes": [],
+    }
     for policy in records["policies"]:
         provenance = _provenance(
             repo_name, policy, "bo_java.spring_sql_bindings.extract_yaml_policy"
         )
         provenance["key"] = policy.get("key")
-        pid = store.add_parameter(
-            schema.PolicyParameter(
-                name=f"{repo_name}:{policy.get('key')}",
-                value=policy.get("value"),
-                description=json.dumps(provenance, sort_keys=True),
-            )
+        pending["policies"].append(
+            {"record": policy, "provenance": provenance}
         )
-        param_ids[str(policy.get("key"))] = pid
-        aggregate["counts"]["params"] += 1
 
-    rule_ids: dict[tuple[str, Any], Any] = {}
     for guard in records["enforced_rules"]:
         provenance = _provenance(
             repo_name, guard, "bo_java.spring_sql_bindings.extract_guards"
         )
-        condition = str(guard.get("condition", ""))
-        try:
-            rel_guard = Path(guard["file"]).relative_to(repo_path)
-        except ValueError:
-            rel_guard = Path(guard["file"]).name
-        rid = store.add_rule(
-            schema.Rule(
-                name=f"{repo_name}:{rel_guard.as_posix()}"
-                f":L{guard.get('guard_if_line')}:{condition[:48]}",
-                value=condition,
-                statement=(
-                    f"enforced rule {guard.get('guard')!r}: "
-                    f"{condition} -> {guard.get('failure_outcome')}"
-                ),
-                predicate=condition,
-                supporting=[provenance],
-                evidence=_evidence(provenance),
-            )
-        )
-        rule_ids[(str(guard.get("file")), guard.get("guard_if_line"))] = rid
-        aggregate["counts"]["rules"] += 1
+        pending["guards"].append({"record": guard, "provenance": provenance})
 
-    transition_ids: dict[tuple[str, Any], Any] = {}
     for trans in records["transitions"]:
         provenance = _provenance(
             repo_name, trans, "bo_java.spring_sql_bindings.extract_guards"
         )
-        target = str(trans.get("target_status", ""))
-        trigger = json.dumps(
-            {"status_write": target, "provenance": provenance}, sort_keys=True
+        pending["transitions"].append(
+            {"record": trans, "provenance": provenance}
         )
-        tid = store.add_transition(
-            schema.Transition(
-                source=None,
-                target=target or "unknown",
-                guard=trans.get("guard"),
-                trigger=trigger,
-                evidence=_evidence(provenance),
-            )
-        )
-        transition_ids[(str(trans.get("file")), trans.get("line"))] = tid
-        aggregate["counts"]["transitions"] += 1
+        target = str(trans.get("target_status") or "unknown")
         if trans.get("guard") is None:
             aggregate["abstentions"].append(
                 {
                     "kind": "unguarded_transition",
                     "repo": repo_name,
                     "target": target,
+                    "guard": trans.get("guard"),
+                    "coverage": trans.get("coverage") or "",
+                    "prerequisites": trans.get("prerequisites") or [],
                     "file": provenance["file"],
                     "line": provenance["line"],
                     "span": provenance["span"],
@@ -374,32 +487,21 @@ def _persist_repo(
             "bo_java.spring_sql_bindings.extract_mapping_routes",
         )
         linkable = _is_linkable_route(route)
-        methods = route.get("http_methods")
-        body = {
-            "http_methods": methods,
-            "path": route.get("path"),
-            "class": route.get("class"),
-            "handler": route.get("method"),
-            "linkable": linkable,
-            "reason": route.get("reason"),
-            "provenance": provenance,
-        }
-        handler = route.get("method") or "unknown"
-        opath = route.get("path") or "unlinkable"
-        store.add_operation(
-            schema.Operation(
-                name=f"{repo_name}:{handler}:{opath}:L{provenance['line']}",
-                description=json.dumps(body, sort_keys=True),
-                evidence=_evidence(provenance),
-            )
+        pending["routes"].append(
+            {
+                "record": route,
+                "provenance": provenance,
+                "linkable": linkable,
+            }
         )
-        aggregate["counts"]["operations"] += 1
         if not linkable:
             aggregate["abstentions"].append(
                 {
                     "kind": "unlinkable_route",
                     "repo": repo_name,
-                    "handler": handler,
+                    "handler": route.get("method") or "unknown",
+                    "path": route.get("path"),
+                    "http_methods": route.get("http_methods"),
                     "file": provenance["file"],
                     "line": provenance["line"],
                     "span": provenance["span"],
@@ -451,21 +553,85 @@ def _persist_repo(
                 }
             )
 
-    aggregate["_param_ids"][repo_name] = param_ids
-    aggregate["_rule_ids"][repo_name] = rule_ids
-    aggregate["_trans_ids"][repo_name] = transition_ids
-    aggregate["_policies"][repo_name] = records["policies"]
-    aggregate["_guards"][repo_name] = records["enforced_rules"]
-    aggregate["_trans"][repo_name] = records["transitions"]
+    aggregate["_policies"][repo_name] = [p["record"] for p in pending["policies"]]
+    aggregate["_guards"][repo_name] = [g["record"] for g in pending["guards"]]
+    aggregate["_trans"][repo_name] = [t["record"] for t in pending["transitions"]]
     aggregate["_bindings_input"][repo_name] = (
         records["openapi"], interfaces, implementations
     )
+    return pending
+
+
+def _persist_extracted(
+    store: OntologyStore,
+    repo_name: str,
+    repo_path: str,
+    aggregate: dict[str, Any],
+    pending: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Insert one repo's extracted payloads; fills the id/linkage caches."""
+    param_ids: dict[str, Any] = {}
+    for item in pending["policies"]:
+        policy = item["record"]
+        pid = store.add_parameter(
+            _param_record(repo_name, policy, item["provenance"])
+        )
+        param_ids[str(policy.get("key"))] = pid
+        aggregate["counts"]["params"] += 1
+
+    rule_ids: dict[tuple[str, Any], Any] = {}
+    for item in pending["guards"]:
+        guard = item["record"]
+        rid = store.add_rule(
+            _rule_record(repo_name, repo_path, guard, item["provenance"])
+        )
+        rule_ids[(str(guard.get("file")), guard.get("guard_if_line"))] = rid
+        aggregate["counts"]["rules"] += 1
+
+    transition_ids: dict[tuple[str, Any], Any] = {}
+    for item in pending["transitions"]:
+        trans = item["record"]
+        tid = store.add_transition(
+            _transition_record(trans, item["provenance"])
+        )
+        transition_ids[(str(trans.get("file")), trans.get("line"))] = tid
+        aggregate["counts"]["transitions"] += 1
+
+    for item in pending["routes"]:
+        route = item["record"]
+        store.add_operation(
+            _operation_record(
+                repo_name, route, item["provenance"], item["linkable"]
+            )
+        )
+        aggregate["counts"]["operations"] += 1
+
+    aggregate["_param_ids"][repo_name] = param_ids
+    aggregate["_rule_ids"][repo_name] = rule_ids
+    aggregate["_trans_ids"][repo_name] = transition_ids
+
+
+def _persist_repo(
+    store: OntologyStore,
+    repo_name: str,
+    repo_path: str,
+    aggregate: dict[str, Any],
+) -> None:
+    """Extract one repo, persist claims, and accumulate cross-repo inputs."""
+    pending = _extract_repo_state(repo_name, repo_path, aggregate)
+    _persist_extracted(store, repo_name, repo_path, aggregate, pending)
 
 
 def _link_dependencies(
-    store: OntologyStore, aggregate: dict[str, Any]
+    store: OntologyStore,
+    aggregate: dict[str, Any],
+    ignore_duplicates: bool = False,
 ) -> None:
-    """Persist explicit same-evidence dependency edges (no name guessing)."""
+    """Persist explicit same-evidence dependency edges (no name guessing).
+
+    With ``ignore_duplicates`` (sync re-derivation), already-present edges
+    are skipped instead of raising; only successful links bump the count.
+    """
     seen: set[tuple[str, Any, str, Any]] = set()
 
     def _link(src_kind, src_id, dst_kind, dst_id, reason):
@@ -473,8 +639,14 @@ def _link_dependencies(
         if key in seen:
             return
         seen.add(key)
-        store.add_dependency(src_kind, src_id, dst_kind, dst_id, reason=reason)
-        aggregate["counts"]["dependencies"] += 1
+        try:
+            store.add_dependency(src_kind, src_id, dst_kind, dst_id,
+                                 reason=reason)
+        except ValueError:
+            if not ignore_duplicates:
+                raise
+        else:
+            aggregate["counts"]["dependencies"] += 1
 
     for repo_name in aggregate["repos"]:
         rule_ids = aggregate["_rule_ids"][repo_name]
@@ -526,56 +698,68 @@ def _link_dependencies(
                 )
 
 
-def _link_contracts(
-    store: OntologyStore, aggregate: dict[str, Any]
-) -> None:
-    """Cross-repo declared-only links; unverified ones become abstentions."""
-    # NOTE: ssb.index() already dedupes client_urls per repo on the same
-    # (file, line, url) key with the same fluent preference, and aggregate
-    # keys are repo-disjoint paths, so no second dedup pass is needed here.
-    # The double walk below is required: links resolve each client URL
-    # against the *unified* openapi/annotation sets across repos (e.g. a
-    # Beta client calling an Alpha path), which per-repo index records
-    # cannot see.
-    urls = aggregate["client_urls"]
+def _compute_links(aggregate: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve every client URL against the unified openapi/annotation sets.
 
+    NOTE: ``ssb.index()`` already dedupes client URLs per repo on the same
+    (file, line, url) key with the same fluent preference, and aggregate
+    keys are repo-disjoint paths, so no second dedup pass is needed here.
+    The double walk below is required: links resolve each client URL
+    against the *unified* openapi/annotation sets across repos (e.g. a
+    Beta client calling an Alpha path), which per-repo index records
+    cannot see.
+    """
+    urls = aggregate["client_urls"]
     links: list[dict[str, Any]] = []
     for url in urls:
         links.extend(ssb.link_client_url(url, aggregate["openapi"]))
         links.extend(
             ssb.link_client_to_annotation(url, aggregate["annotation_operations"])
         )
+    return links
+
+
+def _collect_binding_abstentions(aggregate: dict[str, Any]) -> None:
+    """Append unresolved operation-binding abstentions (per repo, in order)."""
+    for repo_name, (openapi_ops, interfaces, implementations) in aggregate[
+        "_bindings_input"
+    ].items():
+        for op in openapi_ops:
+            binding = ssb.bind_operation_to_implementation(
+                op, interfaces, implementations
+            )
+            if binding.get("binding") != "full":
+                aggregate["abstentions"].append(
+                    {
+                        "kind": "unresolved_binding",
+                        "repo": repo_name,
+                        "operation_id": op.get("operation_id"),
+                        "path": op.get("openapi_path"),
+                        "file": op.get("file"),
+                        "line": op.get("line"),
+                        "span": op.get("span"),
+                        "reason": str(binding.get("reason", "unresolved")),
+                    }
+                )
+
+
+def _link_contracts(
+    store: OntologyStore, aggregate: dict[str, Any]
+) -> None:
+    """Cross-repo declared-only links; unverified ones become abstentions."""
+    links = _compute_links(aggregate)
     aggregate["counts"]["contract_links"] = len(links)
     aggregate["counts"]["compatible_links"] = sum(
         1 for link in links if link.get("compatible") is True
     )
 
     for link in links:
-        provenance = _provenance(
-            "cross-repo", link, "bo_workflow.contract_link"
-        )
-        payload = {
-            "client_url": link.get("client_url"),
-            "client_path": link.get("client_path"),
-            "openapi_path": link.get("openapi_path"),
-            "compatible": bool(link.get("compatible")),
-            "equivalent": False,
-            "destination_verified": False,
-            "destination_evidence": link.get("destination_evidence"),
-            "reason": link.get("reason"),
-            "provenance": provenance,
-        }
-        store.add_assertion(
-            schema.Assertion(
-                subject=f"link:{link.get('client_path')}"
-                f":{link.get('openapi_path')}:{link.get('line')}",
-                predicate=CONTRACT_LINK,
-                object=payload,
-                evidence=_contract_evidence(link),
-            )
-        )
+        store.add_assertion(_contract_assertion(link))
         aggregate["counts"]["assertions"] += 1
         if link.get("compatible") is not True:
+            provenance = _provenance(
+                "cross-repo", link, "bo_workflow.contract_link"
+            )
             aggregate["abstentions"].append(
                 {
                     "kind": "unverified_link",
@@ -598,45 +782,11 @@ def _persist_ledger(
         if entry["kind"] == "unverified_link":
             continue  # already persisted with its contract link
         seq += 1
-        provenance = {
-            "repo": entry.get("repo", ""),
-            "file": str(entry.get("file", "")),
-            "line": int(entry.get("line", 1)),
-            "span": entry.get("span")
-            or {"start_line": 1, "end_line": 1},
-            "content_hash": "",
-            "extractor": "bo_workflow",
-            "extractor_version": WORKFLOW_VERSION,
-            "origin": "deterministic",
-        }
-        store.add_assertion(
-            schema.Assertion(
-                subject=f"{provenance['repo']}:abstention:{seq}",
-                predicate=ABSTENTION,
-                object={**entry, "provenance": provenance},
-            )
-        )
+        store.add_assertion(_ledger_assertion(entry, seq, ABSTENTION))
         aggregate["counts"]["assertions"] += 1
     for entry in aggregate["gaps"]:
         seq += 1
-        provenance = {
-            "repo": entry.get("repo", ""),
-            "file": str(entry.get("file", "")),
-            "line": int(entry.get("line", 1)),
-            "span": entry.get("span")
-            or {"start_line": 1, "end_line": 1},
-            "content_hash": "",
-            "extractor": "bo_workflow",
-            "extractor_version": WORKFLOW_VERSION,
-            "origin": "deterministic",
-        }
-        store.add_assertion(
-            schema.Assertion(
-                subject=f"{provenance['repo']}:gap:{seq}",
-                predicate=GAP,
-                object={**entry, "provenance": provenance},
-            )
-        )
+        store.add_assertion(_ledger_assertion(entry, seq, GAP))
         aggregate["counts"]["assertions"] += 1
 
 
@@ -687,26 +837,7 @@ def ingest_manifest(
     with OntologyStore(str(db_path)) as store:
         for repo in repos:
             _persist_repo(store, repo["name"], repo["path"], aggregate)
-        for repo_name, (openapi_ops, interfaces, implementations) in aggregate[
-            "_bindings_input"
-        ].items():
-            for op in openapi_ops:
-                binding = ssb.bind_operation_to_implementation(
-                    op, interfaces, implementations
-                )
-                if binding.get("binding") != "full":
-                    aggregate["abstentions"].append(
-                        {
-                            "kind": "unresolved_binding",
-                            "repo": repo_name,
-                            "operation_id": op.get("operation_id"),
-                            "path": op.get("openapi_path"),
-                            "file": op.get("file"),
-                            "line": op.get("line"),
-                            "span": op.get("span"),
-                            "reason": str(binding.get("reason", "unresolved")),
-                        }
-                    )
+        _collect_binding_abstentions(aggregate)
         _link_dependencies(store, aggregate)
         _link_contracts(store, aggregate)
         _persist_ledger(store, aggregate)
@@ -722,6 +853,905 @@ def ingest_manifest(
         "extractor_version": WORKFLOW_VERSION,
     }
     return summary
+
+
+# ---------------------------------------------------------------- sync
+
+_STRIP_LINE = re.compile(r"L\d+\b")
+
+# Fail-closed guards (no core rewrite): absolute paths stay supported per the
+# manifest contract, but every repo tree is pre-scanned before any extractor
+# runs. Symlinks are rejected (local-file-inclusion risk; skipping would
+# silently drop facts) and oversized trees are rejected to cap walk cost.
+_MAX_REPO_FILES = 20000
+
+
+def _check_repo_tree(repo_path: str) -> None:
+    """Reject symlinks and cap tree size before extraction (fail-closed)."""
+    root = Path(repo_path)
+    count = 0
+    for entry in root.rglob("*"):
+        # is_symlink() is checked first so broken links still fail closed.
+        if entry.is_symlink():
+            raise ValueError(
+                f"repo {repo_path}: symlink not supported: {entry}"
+            )
+        if entry.is_file():
+            count += 1
+            if count > _MAX_REPO_FILES:
+                raise ValueError(
+                    f"repo {repo_path}: too many files "
+                    f"(>{_MAX_REPO_FILES}); refusing walk"
+                )
+
+
+def _strip_lines(text: str) -> str:
+    """Drop ``L<digits>`` markers so line shifts do not change identity."""
+    return _STRIP_LINE.sub("L", text)
+
+
+def _prereq_key(prereqs: Any) -> list[str]:
+    """Line-free sorted prerequisite guard names for fingerprints/keys."""
+    if not prereqs:
+        return []
+    items: list[str] = []
+    for item in prereqs:
+        if isinstance(item, dict):
+            items.append(_strip_lines(str(item.get("guard") or "")))
+        else:
+            items.append(_strip_lines(str(item or "")))
+    return sorted(items)
+
+
+def _as_json(value: Any) -> Any:
+    """Parse a JSON-encoded column value; pass mappings/lists through."""
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith(("[", "{")):
+            try:
+                return json.loads(text)
+            except ValueError:
+                return None
+    return None
+
+
+def _relpath(repo_path: str | None, file: str) -> str:
+    """Repo-relative posix path; falls back to the raw path when outside."""
+    if not file:
+        return ""
+    if repo_path:
+        try:
+            return Path(file).relative_to(repo_path).as_posix()
+        except ValueError:
+            pass
+    return str(file)
+
+
+def _rel_any(repo_paths: dict[str, str], file: str) -> str:
+    """Relativize against whichever manifest repo contains the file."""
+    for base in repo_paths.values():
+        try:
+            return Path(file).relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return str(file or "")
+
+
+def _sync_identity(
+    kind: str,
+    repo: str,
+    repo_path: str,
+    record: dict[str, Any],
+    provenance: dict[str, Any],
+) -> tuple | None:
+    """Stable fact identity: exact repo+file, line-free content markers.
+
+    Returns None when either side is unparseable (never merge those).
+    """
+    rel = _relpath(repo_path, str(provenance.get("file") or ""))
+    if not repo:
+        return None
+    if kind == "params":
+        key = provenance.get("key", record.get("key"))
+        if key is None:
+            return None
+        return ("params", repo, rel, str(key))
+    if kind == "rules":
+        condition = record.get("condition")
+        if condition is None:
+            return None
+        return ("rules", repo, rel, _strip_lines(str(condition)))
+    if kind == "transitions":
+        return (
+            "transitions",
+            repo,
+            rel,
+            str(record.get("target_status") or "unknown"),
+            _strip_lines(str(record.get("guard") or "")),
+        )
+    if kind == "operations":
+        return (
+            "operations",
+            repo,
+            rel,
+            str(record.get("method") or ""),
+            str(record.get("path") or ""),
+            json.dumps(
+                record.get("http_methods"), sort_keys=True, default=str
+            ),
+        )
+    return None
+
+
+def _nofile_identity(ident: tuple | None) -> tuple | None:
+    """File-less identity: drop the rel component (index 2).
+
+    Used as a fallback when the stored file was redacted to ``[REDACTED]``.
+    """
+    if ident is None or len(ident) < 3:
+        return None
+    return (ident[0], ident[1]) + tuple(ident[3:])
+
+
+def _stored_identity(
+    kind: str, row: dict[str, Any], repo_paths: dict[str, str]
+) -> tuple | None:
+    """Recompute a stored row's sync identity from its persisted columns."""
+    if kind == "params":
+        desc = _as_json(row.get("description")) or {}
+        if not isinstance(desc, dict):
+            desc = {}
+        repo = desc.get("repo")
+        key = desc.get("key")
+        if repo is None or key is None:
+            name = str(row.get("name") or "")
+            if ":" in name:
+                repo, key = name.split(":", 1)
+            else:
+                return None
+        if not repo or key is None:
+            return None
+        return (
+            "params",
+            repo,
+            _relpath(repo_paths.get(repo), str(desc.get("file") or "")),
+            str(key),
+        )
+    if kind == "rules":
+        supporting = _as_json(row.get("supporting"))
+        prov: dict[str, Any] = {}
+        if isinstance(supporting, list) and supporting:
+            prov = supporting[0] if isinstance(supporting[0], dict) else {}
+        elif isinstance(supporting, dict):
+            prov = supporting
+        repo = prov.get("repo")
+        condition = row.get("value")
+        if not repo or condition is None:
+            return None
+        # Provenance file paths are redacted to "[REDACTED]" on insert when
+        # they look secret-like (long spaceless tmp paths); the stored name
+        # (which contains spaces, so it survives redaction) carries the
+        # repo-relative path instead: "<repo>:<rel>:L<line>:<cond>".
+        pfile = str(prov.get("file") or "")
+        if pfile and pfile != "[REDACTED]":
+            rel: str | None = _relpath(repo_paths.get(repo), pfile)
+        else:
+            rel = None
+            prefix = f"{repo}:"
+            name = str(row.get("name") or "")
+            if name.startswith(prefix):
+                match = re.match(
+                    r"^(.+?):L\d+:.*$", name[len(prefix):], re.DOTALL
+                )
+                if match:
+                    rel = match.group(1)
+        if rel is None:
+            return None
+        return ("rules", repo, rel, _strip_lines(str(condition)))
+    if kind == "transitions":
+        trigger = _as_json(row.get("trigger")) or {}
+        if not isinstance(trigger, dict):
+            return None
+        prov = trigger.get("provenance") or {}
+        if not isinstance(prov, dict):
+            prov = {}
+        repo = prov.get("repo")
+        if not repo:
+            return None
+        return (
+            "transitions",
+            repo,
+            _relpath(repo_paths.get(repo), str(prov.get("file") or "")),
+            str(row.get("target") or "unknown"),
+            _strip_lines(str(row.get("guard") or "")),
+        )
+    if kind == "operations":
+        body = _as_json(row.get("description"))
+        if not isinstance(body, dict):
+            return None
+        prov = body.get("provenance") or {}
+        if not isinstance(prov, dict):
+            prov = {}
+        repo = prov.get("repo")
+        if not repo:
+            return None
+        return (
+            "operations",
+            repo,
+            _relpath(repo_paths.get(repo), str(prov.get("file") or "")),
+            str(body.get("handler") or ""),
+            str(body.get("path") or ""),
+            json.dumps(
+                body.get("http_methods"), sort_keys=True, default=str
+            ),
+        )
+    return None
+
+
+def _fresh_fingerprint(kind: str, item: dict[str, Any]) -> str:
+    """Semantic content hash of a freshly extracted record (line-free)."""
+    record = item["record"]
+    if kind == "params":
+        payload = ["v", record.get("value")]
+    elif kind == "rules":
+        payload = [
+            "c",
+            _strip_lines(str(record.get("condition", ""))),
+            _strip_lines(str(record.get("guard") or "")),
+            str(record.get("failure_outcome") or ""),
+        ]
+    elif kind == "transitions":
+        payload = [
+            "t",
+            str(record.get("target_status") or "unknown"),
+            _strip_lines(str(record.get("guard") or "")),
+            _prereq_key(record.get("prerequisites")),
+            str(record.get("coverage") or ""),
+        ]
+    else:
+        payload = [
+            "o",
+            str(record.get("method") or ""),
+            str(record.get("path") or ""),
+            record.get("http_methods"),
+            record.get("class"),
+            item.get("linkable"),
+            record.get("reason"),
+        ]
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def _stored_fingerprint(kind: str, row: dict[str, Any]) -> str:
+    """Semantic content hash of a stored row, mirroring the fresh shape."""
+    if kind == "params":
+        payload = ["v", row.get("value")]
+    elif kind == "rules":
+        guard_val = row.get("preconditions")
+        if isinstance(guard_val, list):
+            guard_val = guard_val[0] if guard_val else ""
+        outcome_val = row.get("outcomes")
+        if isinstance(outcome_val, list):
+            outcome_val = outcome_val[0] if outcome_val else ""
+        # Fallback for rows written before guard/outcome columns existed:
+        # parse the statement "enforced rule '<guard>': <cond> -> <outcome>".
+        if guard_val is None and outcome_val is None:
+            stmt = str(row.get("statement") or "")
+            match = re.match(
+                r"^enforced rule '(.*)': .* -> (.*)$", stmt, re.DOTALL
+            )
+            if match:
+                guard_val, outcome_val = match.group(1), match.group(2)
+        payload = [
+            "c",
+            _strip_lines(str(row.get("value", ""))),
+            _strip_lines(str(guard_val or "")),
+            str(outcome_val or ""),
+        ]
+    elif kind == "transitions":
+        trigger = _as_json(row.get("trigger")) or {}
+        if not isinstance(trigger, dict):
+            trigger = {}
+        payload = [
+            "t",
+            str(row.get("target") or "unknown"),
+            _strip_lines(str(row.get("guard") or "")),
+            _prereq_key(trigger.get("prerequisites")),
+            str(trigger.get("coverage") or ""),
+        ]
+    else:
+        body = _as_json(row.get("description")) or {}
+        if not isinstance(body, dict):
+            body = {}
+        payload = [
+            "o",
+            str(body.get("handler") or ""),
+            str(body.get("path") or ""),
+            body.get("http_methods"),
+            body.get("class"),
+            body.get("linkable"),
+            body.get("reason"),
+        ]
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def _is_active_row(
+    store: OntologyStore, kind: str, row: dict[str, Any]
+) -> bool:
+    """Active = not stale; status-less rows consult invalidate history."""
+    if row.get("status") == "stale":
+        return False
+    if "status" not in row:
+        return not any(
+            e.get("action") == "invalidate"
+            for e in store.history(kind, row.get("id"))
+        )
+    return True
+
+
+def _stored_span(kind: str, row: dict[str, Any]) -> str:
+    """Human span citation (``La-Lb``) from a stored row's provenance."""
+    prov: Any = None
+    if kind == "params":
+        prov = _as_json(row.get("description"))
+    elif kind == "rules":
+        supporting = _as_json(row.get("supporting"))
+        if isinstance(supporting, list) and supporting:
+            prov = supporting[0]
+        elif isinstance(supporting, dict):
+            prov = supporting
+    elif kind == "transitions":
+        trigger = _as_json(row.get("trigger"))
+        prov = trigger.get("provenance") if isinstance(trigger, dict) else None
+    else:
+        body = _as_json(row.get("description"))
+        prov = body.get("provenance") if isinstance(body, dict) else None
+    span = (prov or {}).get("span") if isinstance(prov, dict) else None
+    if isinstance(span, dict):
+        return f"L{span.get('start_line')}-L{span.get('end_line')}"
+    return "L?-L?"
+
+
+def _ledger_key(
+    predicate: str, obj: dict[str, Any], repo_paths: dict[str, str]
+) -> tuple[tuple | None, tuple | None]:
+    """Line-tolerant ledger identity: ``(full key, file-less key)``.
+
+    The file-less key exists only for shapes carrying a file component; it
+    lets a fresh entry match a stored row whose file path was redacted to
+    ``[REDACTED]`` on insert. Either element may be None (unparseable).
+    """
+    if not isinstance(obj, dict):
+        return None, None
+    if predicate == CONTRACT_LINK:
+        key = (
+            "contract_link",
+            obj.get("client_path"),
+            obj.get("openapi_path"),
+            bool(obj.get("compatible")),
+        )
+        return key, None
+    kind = obj.get("kind")
+    repo = obj.get("repo", "")
+    rel = _rel_any(repo_paths, str(obj.get("file") or ""))
+    if kind == "unguarded_transition":
+        guard = _strip_lines(str(obj.get("guard") or ""))
+        coverage = str(obj.get("coverage") or "")
+        prereqs = _prereq_key(obj.get("prerequisites"))
+        prereq_json = json.dumps(prereqs, sort_keys=True, default=str)
+        target = str(obj.get("target") or "unknown")
+        key = (
+            "abstention",
+            kind,
+            repo,
+            rel,
+            target,
+            guard,
+            coverage,
+            prereq_json,
+        )
+        return key, (
+            "abstention",
+            kind,
+            repo,
+            target,
+            guard,
+            coverage,
+            prereq_json,
+        )
+    if kind == "unlinkable_route":
+        handler = str(obj.get("handler") or "unknown")
+        path = str(obj.get("path") or "")
+        methods_json = json.dumps(
+            obj.get("http_methods"), sort_keys=True, default=str
+        )
+        key = ("abstention", kind, repo, rel, handler, path, methods_json)
+        return key, ("abstention", kind, repo, handler, path, methods_json)
+    if kind == "unresolved_binding":
+        key = (
+            "abstention",
+            kind,
+            repo,
+            obj.get("operation_id"),
+            obj.get("path"),
+        )
+        return key, None
+    if kind == "inheritance_gap":
+        key = ("gap", kind, repo, obj.get("class"), obj.get("superclass"))
+        return key, None
+    if kind == "declared_only_enforcement":
+        key = (
+            "gap",
+            kind,
+            repo,
+            rel,
+            _strip_lines(str(obj.get("reason", ""))),
+        )
+        return key, (
+            "gap",
+            kind,
+            repo,
+            _strip_lines(str(obj.get("reason", ""))),
+        )
+    if kind is None:
+        return None, None
+    key = (
+        predicate,
+        kind,
+        repo,
+        rel,
+        _strip_lines(str(obj.get("reason", ""))),
+    )
+    return key, (
+        predicate,
+        kind,
+        repo,
+        _strip_lines(str(obj.get("reason", ""))),
+    )
+
+
+def _fresh_aggregate(
+    repos: list[dict[str, str]],
+) -> tuple[dict[str, Any], dict[str, dict[str, list[dict[str, Any]]]]]:
+    """Extract every manifest repo without inserting (sync source of truth)."""
+    aggregate: dict[str, Any] = {
+        "repos": [r["name"] for r in repos],
+        "counts": {
+            "params": 0,
+            "rules": 0,
+            "transitions": 0,
+            "operations": 0,
+            "assertions": 0,
+            "dependencies": 0,
+            "contract_links": 0,
+            "compatible_links": 0,
+        },
+        "telemetry": {
+            "mapping_routes": 0,
+            "field_constraints": 0,
+            "record_constraints": 0,
+            "interfaces": 0,
+            "implementations": 0,
+            "jpa_entities": 0,
+            "jpa_links": 0,
+            "sql_records": 0,
+            "openapi_operations": 0,
+            "client_urls": 0,
+            "enforced_rules": 0,
+            "raw_transitions": 0,
+        },
+        "abstentions": [],
+        "gaps": [],
+        "openapi": [],
+        "annotation_operations": [],
+        "client_urls": [],
+        "_param_ids": {},
+        "_rule_ids": {},
+        "_trans_ids": {},
+        "_policies": {},
+        "_guards": {},
+        "_trans": {},
+        "_bindings_input": {},
+    }
+    pendings: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for repo in repos:
+        pendings[repo["name"]] = _extract_repo_state(
+            repo["name"], repo["path"], aggregate
+        )
+    _collect_binding_abstentions(aggregate)
+    return aggregate, pendings
+
+
+_VALUE_KINDS = frozenset({"params", "rules"})
+
+
+def sync_manifest(
+    manifest_path: str | Path, db_path: str | Path
+) -> dict[str, Any]:
+    """Diff fresh extraction against the store; invalidate changed/removed.
+
+    Stable per-fact identity is exact ``(kind, repo, file)`` plus line-free
+    content markers; unparseable records never match (abstain, never merge).
+    Changed or removed roots go through ``invalidate_cascade`` with a
+    ``sync: <file>:<span> changed/removed`` trigger reason; replacements are
+    inserted as new rows (never delete; stale rows are preserved). Reviews
+    are never touched; a clean re-run writes nothing.
+    """
+    repos = load_manifest(manifest_path)  # validates before any DB touch
+    repo_paths = {r["name"]: r["path"] for r in repos}
+    aggregate, pendings = _fresh_aggregate(repos)
+    fresh_links = _compute_links(aggregate)
+
+    added = 0
+    unchanged = 0
+    invalidated_roots: list[dict[str, Any]] = []
+    cascaded: list[dict[str, Any]] = []
+    seen_cascade: set[tuple[str, Any]] = set()
+
+    pending_kinds = (
+        ("params", "policies"),
+        ("rules", "guards"),
+        ("transitions", "transitions"),
+        ("operations", "routes"),
+    )
+    # Dependents first: invalidating a root cascades toward its dependents,
+    # so classifying/applying operations -> transitions -> rules -> params
+    # guarantees every kind is diffed against its pre-sync state.
+    sync_order = tuple(reversed(pending_kinds))
+
+    def _note_cascade(pairs: list[tuple]) -> None:
+        for table, rid in pairs:
+            key = (table, rid)
+            if key not in seen_cascade:
+                seen_cascade.add(key)
+                cascaded.append({"kind": table, "id": rid})
+
+    with OntologyStore(str(db_path)) as store:
+        for kind, pkey in sync_order:
+            fresh_by_id: dict[tuple, list[dict[str, Any]]] = {}
+            for repo in repos:
+                for item in pendings[repo["name"]][pkey]:
+                    ident = _sync_identity(
+                        kind,
+                        repo["name"],
+                        repo["path"],
+                        item["record"],
+                        item["provenance"],
+                    )
+                    if ident is None:
+                        continue  # unparseable: abstain, never merge
+                    item["_sync_identity"] = ident
+                    fresh_by_id.setdefault(ident, []).append(item)
+            stored_by_id: dict[tuple, dict[str, list[dict]]] = {}
+            for row in store.all(kind):
+                ident = _stored_identity(kind, row, repo_paths)
+                if ident is None:
+                    continue
+                bucket = stored_by_id.setdefault(
+                    ident, {"active": [], "stale": []}
+                )
+                if _is_active_row(store, kind, row):
+                    bucket["active"].append(row)
+                else:
+                    bucket["stale"].append(row)
+
+            # File-less fallback: a stored file redacted to "[REDACTED]"
+            # on insert can never exactly match its fresh counterpart.
+            # Match those via the nofile key (repo+content, no file) so a
+            # redacted tmp path does not cause permanent removed+added
+            # churn. Exact matches always win; each redacted stored ident
+            # is consumed at most once (pos-ordered like exact buckets).
+            redacted_by_nofile: dict[tuple, list[tuple]] = {}
+            for stored_ident in stored_by_id:
+                if (
+                    len(stored_ident) > 2
+                    and stored_ident[2] == "[REDACTED]"
+                ):
+                    nofile = _nofile_identity(stored_ident)
+                    if nofile is not None:
+                        redacted_by_nofile.setdefault(nofile, []).append(
+                            stored_ident
+                        )
+            effective_stored: dict[tuple, tuple | None] = {}
+            consumed_stored: set[tuple] = set()
+            for fresh_ident in fresh_by_id:
+                if fresh_ident in stored_by_id:
+                    effective_stored[fresh_ident] = fresh_ident
+                    consumed_stored.add(fresh_ident)
+                else:
+                    nofile = _nofile_identity(fresh_ident)
+                    candidates = (
+                        redacted_by_nofile.get(nofile, []) if nofile else []
+                    )
+                    chosen = next(
+                        (c for c in candidates if c not in consumed_stored),
+                        None,
+                    )
+                    effective_stored[fresh_ident] = chosen
+                    if chosen is not None:
+                        consumed_stored.add(chosen)
+            fresh_nofiles = {
+                nf for f in fresh_by_id if (nf := _nofile_identity(f))
+            }
+
+            for ident in list(fresh_by_id) + [
+                i for i in stored_by_id if i not in consumed_stored
+                and i not in fresh_by_id
+            ]:
+                if ident in fresh_by_id:
+                    fresh_items = fresh_by_id.get(ident, [])
+                    eff = effective_stored.get(ident)
+                    actives = (
+                        stored_by_id.get(eff, {}).get("active", [])
+                        if eff is not None
+                        else []
+                    )
+                else:
+                    # Stored-only: skip removal when a redacted row's
+                    # file-less key still has a fresh counterpart (the
+                    # fallback above already paired it, or a duplicate
+                    # shares the content key).
+                    if (
+                        len(ident) > 2
+                        and ident[2] == "[REDACTED]"
+                        and _nofile_identity(ident) in fresh_nofiles
+                    ):
+                        continue
+                    fresh_items = []
+                    actives = stored_by_id.get(ident, {}).get("active", [])
+                for pos, item in enumerate(fresh_items):
+                    if pos >= len(actives):
+                        continue  # inserted below
+                    row = actives[pos]
+                    if _fresh_fingerprint(kind, item) == _stored_fingerprint(
+                        kind, row
+                    ):
+                        unchanged += 1
+                        item["_sync_live"] = True
+                        item["_sync_id"] = row["id"]
+                    else:
+                        item["_sync_changed"] = True
+                        # Remember which stored row this changed item
+                        # replaces so the apply step invalidates the
+                        # fallback row, not a same-shaped exact row.
+                        item["_sync_effective"] = effective_stored.get(ident)
+                for row in actives[len(fresh_items):]:
+                    rel = ident[2] if len(ident) > 2 else ""
+                    # For fallback pairs the fresh rel is informative;
+                    # "[REDACTED]" alone would hide which file changed.
+                    reason = (
+                        f"sync: {rel} removed: source fact no longer "
+                        f"extracted"
+                    )
+                    pairs = store.invalidate_cascade(
+                        kind, row["id"], reason
+                    )
+                    if pairs:
+                        invalidated_roots.append(
+                            {
+                                "kind": kind,
+                                "id": row["id"],
+                                "reason": reason,
+                            }
+                        )
+                        _note_cascade(pairs)
+
+            for ident, fresh_items in fresh_by_id.items():
+                eff = effective_stored.get(ident)
+                actives = (
+                    stored_by_id.get(eff, {}).get("active", [])
+                    if eff is not None
+                    else []
+                )
+                for pos, item in enumerate(fresh_items):
+                    if pos < len(actives) and not item.get("_sync_changed"):
+                        continue
+                    repo = ident[1]
+                    repo_path = repo_paths[repo]
+                    provenance = item["provenance"]
+                    if kind == "params":
+                        record = _param_record(
+                            repo, item["record"], provenance
+                        )
+                    elif kind == "rules":
+                        record = _rule_record(
+                            repo, repo_path, item["record"], provenance
+                        )
+                    elif kind == "transitions":
+                        record = _transition_record(
+                            item["record"], provenance
+                        )
+                    else:
+                        record = _operation_record(
+                            repo,
+                            item["record"],
+                            provenance,
+                            item.get("linkable", False),
+                        )
+                    if pos < len(actives):
+                        row = actives[pos]
+                        rel = ident[2] if len(ident) > 2 else ""
+                        span = _stored_span(kind, row)
+                        if kind == "params":
+                            # Never interpolate raw values: the reason is
+                            # audited and echoed in the sync summary/CLI.
+                            # Old/new values travel only via the store's
+                            # redacted original_value/new_value fields.
+                            detail = "value changed"
+                        elif kind == "rules":
+                            detail = "condition changed"
+                        elif kind == "transitions":
+                            detail = "target/guard changed"
+                        else:
+                            detail = "route changed"
+                        reason = f"sync: {rel}:{span} changed: {detail}"
+                        if kind in _VALUE_KINDS:
+                            pairs = store.invalidate_cascade(
+                                kind,
+                                row["id"],
+                                reason,
+                                record.value,
+                            )
+                        else:
+                            pairs = store.invalidate_cascade(
+                                kind, row["id"], reason
+                            )
+                        if pairs:
+                            invalidated_roots.append(
+                                {
+                                    "kind": kind,
+                                    "id": row["id"],
+                                    "reason": reason,
+                                }
+                            )
+                            _note_cascade(pairs)
+                    new_id = store.insert(record)
+                    added += 1
+                    item["_sync_live"] = True
+                    item["_sync_id"] = new_id
+
+        # Liveness re-check: cascades applied above may have staled rows
+        # that were active at classification time; edges are re-derived
+        # only where both endpoints are still active.
+        for kind, pkey in pending_kinds:
+            for repo in repos:
+                for item in pendings[repo["name"]][pkey]:
+                    if not item.get("_sync_live"):
+                        continue
+                    row = store.get(kind, item["_sync_id"])
+                    if row is None or not _is_active_row(store, kind, row):
+                        item["_sync_live"] = False
+        # Re-derive explicit edges among live endpoints only; existing
+        # edges are skipped instead of raising (idempotent re-run).
+        link_agg: dict[str, Any] = {
+            "repos": [r["name"] for r in repos],
+            "counts": {"dependencies": 0},
+            "_param_ids": {},
+            "_rule_ids": {},
+            "_trans_ids": {},
+            "_policies": {},
+            "_guards": {},
+            "_trans": {},
+        }
+        for repo in repos:
+            link_agg["_policies"][repo["name"]] = []
+            link_agg["_param_ids"][repo["name"]] = {}
+            link_agg["_guards"][repo["name"]] = []
+            link_agg["_rule_ids"][repo["name"]] = {}
+            link_agg["_trans"][repo["name"]] = []
+            link_agg["_trans_ids"][repo["name"]] = {}
+        for repo in repos:
+            pending = pendings[repo["name"]]
+            for item in pending["policies"]:
+                if not item.get("_sync_live"):
+                    continue
+                link_agg["_policies"].setdefault(
+                    repo["name"], []).append(item["record"])
+                link_agg["_param_ids"].setdefault(repo["name"], {})[
+                    str(item["record"].get("key"))] = item["_sync_id"]
+            for item in pending["guards"]:
+                if not item.get("_sync_live"):
+                    continue
+                link_agg["_guards"].setdefault(
+                    repo["name"], []).append(item["record"])
+                link_agg["_rule_ids"].setdefault(repo["name"], {})[(
+                    str(item["record"].get("file")),
+                    item["record"].get("guard_if_line"),
+                )] = item["_sync_id"]
+            for item in pending["transitions"]:
+                if not item.get("_sync_live"):
+                    continue
+                link_agg["_trans"].setdefault(
+                    repo["name"], []).append(item["record"])
+                link_agg["_trans_ids"].setdefault(repo["name"], {})[(
+                    str(item["record"].get("file")),
+                    item["record"].get("line"),
+                )] = item["_sync_id"]
+        _link_dependencies(store, link_agg, ignore_duplicates=True)
+
+        # Ledger: match fresh assertions by stable id, else by line-tolerant
+        # key (file-less fallback covers file paths redacted on insert);
+        # insert only genuinely new entries (never invalidate ledger).
+        fresh_assertions: list[
+            tuple[schema.Assertion, tuple | None, tuple | None]
+        ] = []
+        for link in fresh_links:
+            assertion = _contract_assertion(link)
+            fresh_assertions.append(
+                (
+                    assertion,
+                    (
+                        "contract_link",
+                        link.get("client_path"),
+                        link.get("openapi_path"),
+                        bool(link.get("compatible")),
+                    ),
+                    None,
+                )
+            )
+        seq = 0
+        for entry in aggregate["abstentions"]:
+            if entry["kind"] == "unverified_link":
+                continue  # already persisted with its contract link
+            seq += 1
+            key, nofile = _ledger_key(ABSTENTION, dict(entry), repo_paths)
+            fresh_assertions.append(
+                (_ledger_assertion(entry, seq, ABSTENTION), key, nofile)
+            )
+        for entry in aggregate["gaps"]:
+            seq += 1
+            key, nofile = _ledger_key(GAP, dict(entry), repo_paths)
+            fresh_assertions.append(
+                (_ledger_assertion(entry, seq, GAP), key, nofile)
+            )
+        stored_ids = set()
+        stored_keys = set()
+        stored_nofile: set[tuple] = set()
+        for row in store.all("assertions"):
+            stored_ids.add(row.get("id"))
+            key, nofile = _ledger_key(
+                row.get("predicate", ""),
+                _as_json(row.get("object")) or {},
+                repo_paths,
+            )
+            if key is not None:
+                stored_keys.add(key)
+                if (
+                    nofile is not None
+                    and len(key) > 3
+                    and key[3] == "[REDACTED]"
+                ):
+                    stored_nofile.add(nofile)
+        for assertion, key, nofile in fresh_assertions:
+            if assertion.id in stored_ids:
+                continue
+            if key is not None and key in stored_keys:
+                continue
+            if nofile is not None and nofile in stored_nofile:
+                continue
+            store.add_assertion(assertion)
+            stored_ids.add(assertion.id)
+            if key is not None:
+                stored_keys.add(key)
+                if (
+                    nofile is not None
+                    and len(key) > 3
+                    and key[3] == "[REDACTED]"
+                ):
+                    stored_nofile.add(nofile)
+
+    return {
+        "manifest": str(manifest_path),
+        "db": str(db_path),
+        "repos": [r["name"] for r in repos],
+        "added": added,
+        "unchanged": unchanged,
+        "invalidated_roots": invalidated_roots,
+        "cascaded_stale": cascaded,
+        "abstentions": aggregate["abstentions"],
+        "gaps": aggregate["gaps"],
+    }
 
 
 # ---------------------------------------------------------------- review
