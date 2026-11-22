@@ -348,6 +348,8 @@ def _contract_assertion(link: dict[str, Any]) -> schema.Assertion:
         "destination_verified": False,
         "destination_evidence": link.get("destination_evidence"),
         "reason": link.get("reason"),
+        "method_reason": link.get("method_reason"),
+        "default_method": link.get("default_method", False),
         "provenance": provenance,
     }
     return schema.Assertion(
@@ -411,6 +413,19 @@ def _extract_repo_state(
         implementations.extend(ssb.extract_implements(java))
         entities.extend(ssb.extract_jpa_entities(java))
         enforcement[str(java)] = ssb.has_valid_enforcement(java)
+    # NOTE (intended): _check_repo_tree above already fail-closed on any
+    # symlink, so for repo walks this filter never fires; it is
+    # defense-in-depth for direct extract_ts_client_urls calls.
+    ts_files = sorted(
+        p
+        for pattern in ("*.ts", "*.js")
+        for p in Path(repo_path).rglob(pattern)
+        if not p.is_symlink()
+    )
+    for ts_file in ts_files:
+        ts_records = ssb.extract_ts_client_urls(ts_file)
+        aggregate["client_urls"].extend(ts_records)
+        aggregate["telemetry"]["client_urls"] += len(ts_records)
     inherited = ssb.resolve_inheritance(java_files)
     jpa_links = ssb.link_jpa_to_sql(entities, records["persistence"])
 

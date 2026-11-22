@@ -1127,6 +1127,171 @@ def _find_realworld_files():
     return found
 
 
+WRAPPED_CONTROLLER = """\
+package com.example.orders;
+
+import javax.validation.Valid;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping(path = "/shipments")
+public class ShipmentWrappedController {
+
+    @PostMapping
+    public ResponseEntity createShipment(
+            @Valid @RequestBody NewShipmentParam newShipmentParam,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok("");
+    }
+
+    @GetMapping(path = "feed")
+    public ResponseEntity listFeed(
+            @RequestParam(value = "offset", defaultValue = "0") int offset,
+            @RequestParam(value = "limit", defaultValue = "20") int limit) {
+        return ResponseEntity.ok("");
+    }
+}
+"""
+
+UNCLOSED_CONTROLLER = """\
+package com.example.orders;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ShipmentUnclosedController {
+
+    @GetMapping("/half")
+    public String halfOpen(String a,
+            String b,
+            String c,
+            String d,
+            String e,
+            String f,
+            String g,
+            String h,
+            String i,
+            String j,
+            String k) {
+        return "ok";
+    }
+
+    @GetMapping("/whole")
+    public String whole() {
+        return "ok";
+    }
+}
+"""
+
+WRAPPED_DYNAMIC_CONTROLLER = """\
+package com.example.orders;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ShipmentWrappedDynamicController {
+
+    private static final String PATH_CONST = "/dynamic";
+
+    @GetMapping(PATH_CONST)
+    public String byConst(
+            String a) {
+        return "ok";
+    }
+
+    @RequestMapping(value = "/novel")
+    public String novel(
+            String a) {
+        return "ok";
+    }
+}
+"""
+
+
+def test_wrapped_signatures_join_continuation_lines(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "ShipmentWrappedController.java", WRAPPED_CONTROLLER
+    )
+    assert len(routes) == 2, routes
+    by_method = {r["method"]: r for r in routes}
+    create = by_method["createShipment"]
+    assert create["http_methods"] == ["post"], create
+    assert create["path"] == "/shipments", create
+    assert create["span"]["start_line"] == create["method_annotation"]["line"], create
+    assert create["span"]["end_line"] > create["line"], create
+    feed = by_method["listFeed"]
+    assert feed["http_methods"] == ["get"], feed
+    assert feed["path"] == "/shipments/feed", feed
+    assert feed["span"]["end_line"] > feed["line"], feed
+    for route in routes:
+        assert route["kind"] == "mapping_route", route
+        assert route["source"] == "spring_annotation", route
+
+
+def test_unclosed_decl_beyond_bound_abstains_single_line_survives(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path, "ShipmentUnclosedController.java", UNCLOSED_CONTROLLER
+    )
+    assert [r["method"] for r in routes] == ["whole"], routes
+    assert routes[0]["path"] == "/whole", routes
+    assert routes[0]["http_methods"] == ["get"], routes
+
+
+PAREN_IN_STRING_CONTROLLER = """\
+package com.example.orders;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/punct")
+public class PunctController {
+
+    @GetMapping("/by")
+    public String by(@RequestParam(value = ")") String sep) {
+        return "ok";
+    }
+}
+"""
+
+
+def test_paren_in_string_decl_parses_single_line(tmp_path):
+    """LOW: a ``)`` inside a string literal (``value = ")"``) must not trick
+    the wrap detector into joining continuation lines and dropping the route."""
+    routes, _ = _routes_for(
+        tmp_path, "PunctController.java", PAREN_IN_STRING_CONTROLLER
+    )
+    assert [r["method"] for r in routes] == ["by"], routes
+    assert routes[0]["path"] == "/punct/by", routes
+    assert routes[0]["http_methods"] == ["get"], routes
+
+
+def test_wrapped_dynamic_and_verb_unknown_still_abstain(tmp_path):
+    routes, _ = _routes_for(
+        tmp_path,
+        "ShipmentWrappedDynamicController.java",
+        WRAPPED_DYNAMIC_CONTROLLER,
+    )
+    assert len(routes) == 2, routes
+    by_method = {r["method"]: r for r in routes}
+    assert by_method["byConst"]["path"] is None, routes
+    assert "dynamic" in str(by_method["byConst"].get("reason", "")).lower(), routes
+    assert by_method["novel"]["http_methods"] is None, routes
+    assert by_method["novel"]["verb_unknown"] is True, routes
+
+
 def test_realworld_exposed_regression_requestmapping_post():
     """REGRESSION (read-only): exposed tree bare static-import POST resolves."""
     candidates = _find_realworld_files()
