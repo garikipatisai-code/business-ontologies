@@ -1956,3 +1956,232 @@ def report(db_path: str | Path) -> dict[str, Any]:
         "contract_links": links,
         "reviews": reviews,
     }
+
+
+# ---------------------------------------------------------------- markdown report
+
+
+def _md_cell(value: Any) -> str:
+    """Escape one Markdown table cell (no raw pipes, links, or HTML).
+
+    The report payload is already secret-redacted upstream; this guards
+    table structure (``|`` -> ``\\|``, newlines -> ``<br/>``) and
+    neutralizes Markdown link/image syntax (``[``/``]``/``(``/``)`` ->
+    backslash-escaped) and HTML (``&``/``<``/``>`` -> entities) so cell
+    text cannot become a clickable link/image or raw HTML. Backticks pass
+    through unchanged (code spans are inert) and the exact ``[REDACTED]``
+    token is preserved verbatim.
+    """
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    text = text.replace("\r", "")
+    # Escape HTML on raw user text before inserting our own <br/> marker.
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Neutralize link/image syntax.
+    text = (
+        text.replace("[", "\\[").replace("]", "\\]")
+        .replace("(", "\\(").replace(")", "\\)")
+    )
+    # Preserve the exact redaction token verbatim.
+    text = text.replace("\\[REDACTED\\]", "[REDACTED]")
+    text = text.replace("\n", "<br/>")
+    return text.replace("|", "\\|")
+
+
+def _md_object(obj: Any) -> dict[str, Any]:
+    """Assertion ``object`` payload as a dict (stored JSON or mapping)."""
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, str):
+        text = obj.strip()
+        if text.startswith(("[", "{")):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                return {}
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def _md_bool(value: Any) -> str:
+    """Lowercase ``true``/``false`` rendering for Markdown cells."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return _md_cell(value)
+
+
+def _md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    """Render one Markdown table (or ``None`` when there are no rows)."""
+    if not rows:
+        return ["None"]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows)
+    return lines
+
+
+def report_markdown(db_path: str | Path) -> str:
+    """Render ``report(db_path)`` as deterministic Markdown (pure readout).
+
+    No timestamps: sections are sorted by ``(kind, id)`` / subject so two
+    runs over the same store are byte-identical. Rules/operations carry
+    file/line provenance (``<repo>:<path>:L<line>:...``); params show
+    ``repo:key`` and transitions show target. Contract links are
+    declared-only (``destination_verified`` always false,
+    ``equivalent`` never true).
+    """
+    data = report(db_path)
+    db_cell = _md_cell(data["db"]).replace("`", "\\`")
+    lines = ["# Workflow Report", "", f"Database: `{db_cell}`", ""]
+
+    lines.append("## Summary")
+    lines.append("")
+    lines.extend(
+        _md_table(
+            ["Metric", "Count"],
+            [
+                [_md_cell(metric), str(count)]
+                for metric, count in sorted(data["counts"].items())
+            ],
+        )
+    )
+    lines.append("")
+
+    lines.append("## Active Claims")
+    lines.append("")
+    lines.append(
+        "Rules/operations carry file/line provenance "
+        "(`<repo>:<path>:L<line>:...`); params show `repo:key`, "
+        "transitions show target."
+    )
+    lines.append("")
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for entry in sorted(data["active"], key=lambda e: (e["kind"], e["id"])):
+        by_kind.setdefault(entry["kind"], []).append(entry)
+    if not by_kind:
+        lines.append("None")
+        lines.append("")
+    for kind in sorted(by_kind):
+        lines.append(f"### {kind}")
+        lines.append("")
+        lines.extend(
+            _md_table(
+                ["ID", "Name", "Status"],
+                [
+                    [
+                        _md_cell(e["id"]),
+                        _md_cell(e["name"]),
+                        _md_cell(e["status"]),
+                    ]
+                    for e in by_kind[kind]
+                ],
+            )
+        )
+        lines.append("")
+
+    lines.append("## Stale Claims")
+    lines.append("")
+    lines.extend(
+        _md_table(
+            ["Kind", "ID", "Name", "Status", "Trigger"],
+            [
+                [
+                    _md_cell(e["kind"]),
+                    _md_cell(e["id"]),
+                    _md_cell(e["name"]),
+                    _md_cell(e["status"]),
+                    _md_cell(e.get("trigger")),
+                ]
+                for e in sorted(
+                    data["stale"], key=lambda e: (e["kind"], e["id"])
+                )
+            ],
+        )
+    )
+    lines.append("")
+
+    lines.append("## Cross-Repo Contract Links")
+    lines.append("")
+    lines.append(
+        "All links are declared-only: `destination_verified` is always "
+        "false and `equivalent` is never true."
+    )
+    lines.append("")
+    link_rows: list[list[str]] = []
+    for link in sorted(
+        data["contract_links"],
+        key=lambda a: str(a.get("subject")),
+    ):
+        obj = _md_object(link.get("object"))
+        link_rows.append(
+            [
+                _md_cell(obj.get("client_path") or obj.get("client_url")),
+                _md_cell(obj.get("openapi_path")),
+                _md_bool(obj.get("compatible", False)),
+                _md_bool(obj.get("equivalent", False)),
+                _md_bool(obj.get("destination_verified", False)),
+                _md_cell(obj.get("reason")),
+            ]
+        )
+    lines.extend(
+        _md_table(
+            [
+                "Client",
+                "Operation",
+                "Compatible",
+                "Equivalent",
+                "Destination Verified",
+                "Reason",
+            ],
+            link_rows,
+        )
+    )
+    lines.append("")
+
+    lines.append("## Abstentions & Gaps")
+    lines.append("")
+    for title, rows_data in (
+        ("Abstentions", data["abstentions"]),
+        ("Gaps", data["gaps"]),
+    ):
+        lines.append(f"### {title}")
+        lines.append("")
+        ledger_rows = [
+            [
+                _md_cell(a.get("subject")),
+                _md_cell(_md_object(a.get("object")).get("reason")),
+            ]
+            for a in sorted(rows_data, key=lambda a: str(a.get("subject")))
+        ]
+        lines.extend(_md_table(["Subject", "Reason"], ledger_rows))
+        lines.append("")
+
+    lines.append("## Human Reviews")
+    lines.append("")
+    lines.extend(
+        _md_table(
+            ["Subject", "Reviewer", "Status", "Reason"],
+            [
+                [
+                    _md_cell(r.get("subject")),
+                    _md_cell(r.get("reviewer")),
+                    _md_cell(r.get("status")),
+                    _md_cell(r.get("reason")),
+                ]
+                for r in sorted(
+                    data["reviews"],
+                    key=lambda r: (
+                        str(r.get("subject")),
+                        str(r.get("reviewer")),
+                    ),
+                )
+            ],
+        )
+    )
+    return "\n".join(lines).rstrip("\n")
