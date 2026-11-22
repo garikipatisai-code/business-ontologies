@@ -510,7 +510,14 @@ def _join_mapping_paths(class_base: str | None, method_path: str | None) -> str:
 
 
 def _annotation_path_match(pattern: str | None, actual: str | None) -> bool:
-    """Path equality with ``{var}`` template segments (one segment each)."""
+    """Path equality with ``{var}``/``*`` template segments (one each).
+
+    A whole-segment ``*`` (Spring single-segment wildcard, pinned:
+    ``owners/*/pets/{petId}``) matches any single non-empty segment,
+    mirroring ``{var}``; anything else stays literal (``**`` included:
+    multi-segment abstains, fail-closed). A literal ``*`` client segment
+    counts as non-empty (URLs never contain bare ``*``; harmless, unchanged).
+    """
     if not pattern or not actual:
         return False
     if pattern == actual:
@@ -521,6 +528,10 @@ def _annotation_path_match(pattern: str | None, actual: str | None) -> bool:
         return False
     for want, got in zip(expected, seen):
         if len(want) >= 2 and want.startswith("{") and want.endswith("}"):
+            if not got:
+                return False
+            continue
+        if want == "*":
             if not got:
                 return False
             continue
@@ -800,7 +811,8 @@ def link_client_to_annotation(
     """Declared-only links between a client URL and annotation operations.
 
     Compatible only when the client path matches the annotation path
-    (equality or ``{var}`` template) *and* the client method matches
+    (equality or ``{var}``/``*`` single-segment templates) *and* the
+    client method matches
     the operation verb *and* invocation evidence exists (a supported
     ``RestTemplate`` call line in the same method) *and* the route is
     unambiguous (a single operation for path+method; duplicates
@@ -925,9 +937,14 @@ def link_client_to_annotation(
             )
         elif link["compatible"]:
             op_line = op.get("span", {}).get("start_line", op["line"]) if isinstance(op.get("span"), dict) else op["line"]
+            path_verb = (
+                "matches annotation template"
+                if isinstance(op_path, str) and op_path != client_path
+                else "== annotation path"
+            )
             link["reason"] = (
-                f"compatible contract (annotation-backed): client path {client_path} == "
-                f"annotation path {op_path} and method {client_method} == {op_norm}; "
+                f"compatible contract (annotation-backed): client path {client_path} {path_verb} "
+                f"{op_path} and method {client_method} == {op_norm}; "
                 f"binding L{url_record['line']} + call L{call_line} + annotation path "
                 f"L{op_line} + method L{op['line']}; {never_equiv}; {op_only}"
             )
